@@ -1,7 +1,38 @@
-/target
-build
-configure
-.idea
-duckdb_unittest_tempdir
-/test/bin
-venv
+*
+
+# project root files
+!.gitignore
+!.gitmodules
+!.envrc
+!Cargo.toml
+!Cargo.lock
+!Makefile
+!README.md
+!LICENSE
+!flake.nix
+!flake.lock
+
+# cargo config
+!/.cargo
+!/.cargo/config.toml
+
+# source
+!/src
+!/src/*.rs
+
+# tests
+!/test
+!/test/sql
+!/test/sql/*.test
+
+# github
+!/.github
+!/.github/workflows
+!/.github/workflows/*.yml
+!/.github/workflows/*.yaml
+
+# extension-ci-tools submodule (managed by git submodules)
+!/extension-ci-tools
+
+# agents directory (reference repos and docs, not checked in)
+.agents/

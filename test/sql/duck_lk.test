@@ -1,0 +1,20 @@
+# name: test/sql/duck_lk.test
+# description: test duck_lk extension
+# group: [duck_lk]
+
+# Before we load the extension, this will fail
+statement error
+SELECT duck_lk('Sam');
+----
+Catalog Error: Scalar Function with name duck_lk does not exist!
+
+# Require statement will ensure the extension is loaded from now on
+require duck_lk
+
+require icu
+
+# Confirm the extension works
+query I
+SELECT * from duck_lk('Sam');
+----
+Rusty Quack Sam 🐥
