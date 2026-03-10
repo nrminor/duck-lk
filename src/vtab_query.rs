@@ -48,6 +48,8 @@ pub(crate) struct LabkeyBindData {
     /// `LabKey` query name (positional param 1).
     query_name: String,
     /// Whether to skip staleness check and serve only from cache.
+    // TODO: read this field in init() to skip staleness checks when true.
+    #[allow(dead_code)]
     offline: bool,
     /// Path to the Parquet file to read (set after cache resolution).
     /// `Some` = cache hit, `None` = cache miss / stale.

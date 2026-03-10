@@ -1,5 +1,9 @@
-// The `duckdb_entrypoint_c_api` proc macro generates hidden FFI glue functions
-// whose signatures and internals we cannot control.
+// The `duckdb_entrypoint_c_api` proc macro generates hidden top-level FFI glue
+// functions that contain `.unwrap()` calls and signatures we cannot control.
+// These allows must be crate-level (`#![allow]`) because the generated functions
+// are at module scope, not inside `extension_entrypoint` — a function-level
+// `#[allow]` would not cover them. Production code avoids `.unwrap()` entirely;
+// only the proc-macro output and test assertions (`.unwrap_err()`) rely on this.
 #![allow(
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
@@ -9,102 +13,32 @@
     clippy::unwrap_used
 )]
 
-// NOTE: This module is intentionally `mod` (not `pub mod`). All `pub(crate)`
-// items are crate-internal. Do not make this `pub mod` without a semver review
+// NOTE: These modules are intentionally `mod` (not `pub mod`). All `pub(crate)`
+// items are crate-internal. Do not make these `pub mod` without a semver review
 // — it would expose labkey_rs, arrow, and duckdb types as part of our API.
-//
-// Functions are consumed by vtab_query (US-004) and other VTab modules that
-// haven't landed yet. Allow dead code until they're wired up.
 //
 // The `#[path]` is required because wasm_lib.rs re-includes lib.rs via
 // `mod lib;`, which changes the module root to src/lib/ instead of src/.
-#[allow(dead_code)]
 #[path = "types.rs"]
 mod types;
 
-#[allow(dead_code)]
 #[path = "credential.rs"]
 mod credential;
 
-#[allow(dead_code)]
 #[path = "cache.rs"]
 mod cache;
 
-#[allow(dead_code)]
 #[path = "vtab_query.rs"]
 mod vtab_query;
 
-#[allow(dead_code)]
 #[path = "vtab_cache_info.rs"]
 mod vtab_cache_info;
 
-#[allow(dead_code)]
 #[path = "vtab_cache_clear.rs"]
 mod vtab_cache_clear;
 
-use duckdb::{
-    core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
-    duckdb_entrypoint_c_api,
-    vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
-    Connection, Result,
-};
-use std::{
-    error::Error,
-    ffi::CString,
-    sync::atomic::{AtomicBool, Ordering},
-};
-
-#[repr(C)]
-struct HelloBindData {
-    name: String,
-}
-
-#[repr(C)]
-struct HelloInitData {
-    done: AtomicBool,
-}
-
-struct HelloVTab;
-
-impl VTab for HelloVTab {
-    type InitData = HelloInitData;
-    type BindData = HelloBindData;
-
-    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        bind.add_result_column("column0", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        let name = bind.get_parameter(0).to_string();
-        Ok(HelloBindData { name })
-    }
-
-    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        Ok(HelloInitData {
-            done: AtomicBool::new(false),
-        })
-    }
-
-    fn func(
-        func: &TableFunctionInfo<Self>,
-        output: &mut DataChunkHandle,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let init_data = func.get_init_data();
-        let bind_data = func.get_bind_data();
-        if init_data.done.swap(true, Ordering::Relaxed) {
-            output.set_len(0);
-        } else {
-            let vector = output.flat_vector(0);
-            let result = CString::new(format!("Rusty Quack {} 🐥", bind_data.name))?;
-            vector.insert(0, result);
-            output.set_len(1);
-        }
-        Ok(())
-    }
-
-    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
-        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
-    }
-}
-
-const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
+use duckdb::{duckdb_entrypoint_c_api, Connection};
+use std::error::Error;
 
 /// Register the `duck_lk` extension's table functions with `DuckDB`.
 ///
@@ -118,6 +52,8 @@ const EXTENSION_NAME: &str = env!("CARGO_PKG_NAME");
 /// Returns an error if table function registration fails.
 #[duckdb_entrypoint_c_api()]
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
-    con.register_table_function::<HelloVTab>(EXTENSION_NAME)?;
+    con.register_table_function::<vtab_query::LabkeyQueryVTab>("labkey_query")?;
+    con.register_table_function::<vtab_cache_clear::LabkeyCacheClearVTab>("labkey_cache_clear")?;
+    con.register_table_function::<vtab_cache_info::LabkeyCacheInfoVTab>("labkey_cache_info")?;
     Ok(())
 }

@@ -19,9 +19,6 @@ use duckdb::{
 
 use super::cache;
 
-/// Number of result columns in the `labkey_cache_info` schema.
-const COLUMN_COUNT: usize = 10;
-
 const STALENESS_AVAILABLE: &str = "available";
 const STALENESS_UNAVAILABLE: &str = "unavailable (no Modified column)";
 
