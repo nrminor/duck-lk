@@ -22,6 +22,10 @@
 #[path = "types.rs"]
 mod types;
 
+#[allow(dead_code)]
+#[path = "credential.rs"]
+mod credential;
+
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
     duckdb_entrypoint_c_api,
