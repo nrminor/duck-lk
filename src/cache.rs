@@ -62,6 +62,21 @@ pub(crate) struct CacheColumn {
     pub(crate) json_type: Option<String>,
 }
 
+/// Extracts a lowercase hostname and normalized container from a base URL and
+/// container path. Shared by [`cache_key`] and [`parquet_relative_path`].
+fn parse_host_and_container<'a>(
+    base_url: &str,
+    container_path: &'a str,
+) -> Result<(String, &'a str), Box<dyn Error>> {
+    let parsed = Url::parse(base_url)?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| format!("No host in URL: {base_url}"))?
+        .to_lowercase();
+    let container = container_path.trim_matches('/');
+    Ok((host, container))
+}
+
 /// Computes a cache key from connection parameters.
 ///
 /// The hostname is extracted via `Url::parse` and lowercased. The container
@@ -73,13 +88,27 @@ pub(crate) fn cache_key(
     schema: &str,
     query: &str,
 ) -> Result<String, Box<dyn Error>> {
-    let parsed = Url::parse(base_url)?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| format!("No host in URL: {base_url}"))?
-        .to_lowercase();
-    let container = container_path.trim_matches('/');
+    let (host, container) = parse_host_and_container(base_url, container_path)?;
     Ok(format!("{host}|{container}|{schema}|{query}"))
+}
+
+/// Computes the relative Parquet file path for a cache entry.
+///
+/// Uses the same hostname extraction and container normalization as
+/// [`cache_key`]. Returns a path like `"host/container/schema/query.parquet"`
+/// or `"host/schema/query.parquet"` when the container is empty (root `/`).
+pub(crate) fn parquet_relative_path(
+    base_url: &str,
+    container_path: &str,
+    schema: &str,
+    query: &str,
+) -> Result<String, Box<dyn Error>> {
+    let (host, container) = parse_host_and_container(base_url, container_path)?;
+    if container.is_empty() {
+        Ok(format!("{host}/{schema}/{query}.parquet"))
+    } else {
+        Ok(format!("{host}/{container}/{schema}/{query}.parquet"))
+    }
 }
 
 pub(crate) struct CacheManager {
@@ -376,6 +405,55 @@ mod tests {
     #[test]
     fn cache_key_url_without_host_is_error() {
         let result = cache_key("file:///foo/bar", "/", "s", "q");
+        assert!(result.is_err());
+    }
+
+    // -- parquet_relative_path tests --
+
+    #[test]
+    fn parquet_relative_path_basic() {
+        let path = parquet_relative_path(
+            "https://labkey.example.com/labkey",
+            "/MyProject",
+            "lists",
+            "People",
+        )
+        .expect("parquet_relative_path");
+        assert_eq!(path, "labkey.example.com/MyProject/lists/People.parquet");
+    }
+
+    #[test]
+    fn parquet_relative_path_root_container() {
+        let path = parquet_relative_path("https://labkey.example.com", "/", "core", "Users")
+            .expect("parquet_relative_path");
+        assert_eq!(path, "labkey.example.com/core/Users.parquet");
+    }
+
+    #[test]
+    fn parquet_relative_path_nested_container() {
+        let path = parquet_relative_path(
+            "https://labkey.example.com",
+            "/Project/SubFolder/",
+            "lists",
+            "Data",
+        )
+        .expect("parquet_relative_path");
+        assert_eq!(
+            path,
+            "labkey.example.com/Project/SubFolder/lists/Data.parquet"
+        );
+    }
+
+    #[test]
+    fn parquet_relative_path_hostname_lowercased() {
+        let path = parquet_relative_path("https://LABKEY.Example.COM", "/proj", "s", "q")
+            .expect("parquet_relative_path");
+        assert_eq!(path, "labkey.example.com/proj/s/q.parquet");
+    }
+
+    #[test]
+    fn parquet_relative_path_invalid_url_is_error() {
+        let result = parquet_relative_path("not-a-url", "/", "s", "q");
         assert!(result.is_err());
     }
 

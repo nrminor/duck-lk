@@ -30,6 +30,10 @@ mod credential;
 #[path = "cache.rs"]
 mod cache;
 
+#[allow(dead_code)]
+#[path = "vtab_query.rs"]
+mod vtab_query;
+
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
     duckdb_entrypoint_c_api,
