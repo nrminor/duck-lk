@@ -38,6 +38,10 @@ mod vtab_query;
 #[path = "vtab_cache_info.rs"]
 mod vtab_cache_info;
 
+#[allow(dead_code)]
+#[path = "vtab_cache_clear.rs"]
+mod vtab_cache_clear;
+
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
     duckdb_entrypoint_c_api,
