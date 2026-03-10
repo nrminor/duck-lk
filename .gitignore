@@ -36,3 +36,6 @@
 
 # agents directory (reference repos and docs, not checked in)
 .agents/
+
+# opencode config
+!opencode.json
