@@ -1,0 +1,35 @@
+# name: test/sql/duck_lk_arity.test
+# description: arity validation for all three table functions
+# group: [duck_lk]
+
+require duck_lk
+
+# labkey_query: 0 args (expects 2)
+statement error
+SELECT * FROM labkey_query();
+----
+labkey_query
+
+# labkey_query: 1 arg (expects 2)
+statement error
+SELECT * FROM labkey_query('core');
+----
+labkey_query
+
+# labkey_query: 3 args (expects 2)
+statement error
+SELECT * FROM labkey_query('core', 'users', 'extra');
+----
+labkey_query
+
+# labkey_cache_info: rejects positional arguments
+statement error
+SELECT * FROM labkey_cache_info('unexpected');
+----
+labkey_cache_info
+
+# labkey_cache_clear: rejects positional arguments
+statement error
+SELECT * FROM labkey_cache_clear('lists');
+----
+labkey_cache_clear

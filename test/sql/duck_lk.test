@@ -1,20 +1,41 @@
 # name: test/sql/duck_lk.test
-# description: test duck_lk extension
+# description: test duck_lk extension error paths and empty-state behavior
 # group: [duck_lk]
 
-# Before we load the extension, this will fail
-statement error
-SELECT duck_lk('Sam');
-----
-Catalog Error: Scalar Function with name duck_lk does not exist!
-
-# Require statement will ensure the extension is loaded from now on
+# Load the extension (skips remaining tests if unavailable)
 require duck_lk
 
-require icu
-
-# Confirm the extension works
-query I
-SELECT * from duck_lk('Sam');
+# labkey_query without base_url produces a clear error
+statement error
+SELECT * FROM labkey_query('core', 'users');
 ----
-Rusty Quack Sam 🐥
+No LabKey base URL
+
+# labkey_cache_info returns an empty result set when nothing is cached
+query TTTTIITTTT
+SELECT * FROM labkey_cache_info();
+----
+
+# labkey_cache_clear succeeds with a status message when no cache exists
+query T
+SELECT * FROM labkey_cache_clear();
+----
+No cached tables to clear.
+
+# labkey_cache_clear with schema but no query is rejected
+statement error
+SELECT * FROM labkey_cache_clear(schema := 'lists');
+----
+Both schema and query
+
+# labkey_cache_clear with query but no schema is rejected
+statement error
+SELECT * FROM labkey_cache_clear(query := 'People');
+----
+Both schema and query
+
+# labkey_cache_clear with both params on empty cache returns informative message
+query T
+SELECT * FROM labkey_cache_clear(schema := 'lists', query := 'People');
+----
+No cached data found for lists.People. Nothing to clear.
