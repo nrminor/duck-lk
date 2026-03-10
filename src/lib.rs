@@ -9,6 +9,19 @@
     clippy::unwrap_used
 )]
 
+// NOTE: This module is intentionally `mod` (not `pub mod`). All `pub(crate)`
+// items are crate-internal. Do not make this `pub mod` without a semver review
+// — it would expose labkey_rs, arrow, and duckdb types as part of our API.
+//
+// Functions are consumed by vtab_query (US-004) and other VTab modules that
+// haven't landed yet. Allow dead code until they're wired up.
+//
+// The `#[path]` is required because wasm_lib.rs re-includes lib.rs via
+// `mod lib;`, which changes the module root to src/lib/ instead of src/.
+#[allow(dead_code)]
+#[path = "types.rs"]
+mod types;
+
 use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
     duckdb_entrypoint_c_api,
