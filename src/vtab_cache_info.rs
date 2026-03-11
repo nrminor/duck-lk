@@ -75,9 +75,8 @@ pub(crate) struct CacheInfoBindData;
 pub(crate) struct CacheInfoInitData {
     rows: Vec<CacheInfoRow>,
     /// Current row offset for chunked emission. Uses `AtomicUsize` because
-    /// the `VTab` trait requires `Send + Sync`. Safe with `Relaxed` because
-    /// `set_max_threads(1)` is not called here (`cache_info` is cheap enough
-    /// that `DuckDB` manages thread safety itself).
+    /// the `VTab` trait requires `Send + Sync`. Safe with `Relaxed` ordering
+    /// because `set_max_threads(1)` ensures single-threaded scanning.
     row_offset: AtomicUsize,
 }
 
@@ -123,7 +122,7 @@ impl VTab for LabkeyCacheInfoVTab {
         Ok(CacheInfoBindData)
     }
 
-    fn init(_init: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
+    fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
         let mgr = cache::CacheManager::new()?;
         let entries = mgr.list_entries();
 
@@ -131,6 +130,8 @@ impl VTab for LabkeyCacheInfoVTab {
             .into_iter()
             .map(|(_key, entry)| cache_entry_to_row(&mgr, &entry))
             .collect();
+
+        init.set_max_threads(1);
 
         Ok(CacheInfoInitData {
             rows,

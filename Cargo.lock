@@ -1247,7 +1247,7 @@ dependencies = [
 [[package]]
 name = "labkey-rs"
 version = "0.1.0"
-source = "git+https://github.com/nrminor/labkey-rs.git?branch=main#95527865859d60c12f8a562b619d48ea6d336ed8"
+source = "git+https://github.com/nrminor/labkey-rs.git?rev=95527865859d60c12f8a562b619d48ea6d336ed8#95527865859d60c12f8a562b619d48ea6d336ed8"
 dependencies = [
  "base64",
  "bon",

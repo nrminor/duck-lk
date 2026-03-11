@@ -62,53 +62,91 @@ pub(crate) struct CacheColumn {
     pub(crate) json_type: Option<String>,
 }
 
-/// Extracts a lowercase hostname and normalized container from a base URL and
-/// container path. Shared by [`cache_key`] and [`parquet_relative_path`].
-fn parse_host_and_container<'a>(
+/// Parsed URL components used for cache key and Parquet path construction.
+struct UrlParts<'a> {
+    /// Lowercase hostname (e.g. `"labkey.example.com"`).
+    host: String,
+    /// URL path with leading/trailing `/` stripped (e.g. `"labkey"` from
+    /// `https://host/labkey`). Empty string if the URL has no path beyond `/`.
+    /// This distinguishes multiple `LabKey` instances on the same host.
+    context_path: String,
+    /// Container path with leading/trailing `/` stripped.
+    container: &'a str,
+}
+
+/// Extracts a lowercase hostname, context path, and normalized container from
+/// a base URL and container path. Shared by [`cache_key`] and
+/// [`parquet_relative_path`].
+fn parse_url_parts<'a>(
     base_url: &str,
     container_path: &'a str,
-) -> Result<(String, &'a str), Box<dyn Error>> {
+) -> Result<UrlParts<'a>, Box<dyn Error>> {
     let parsed = Url::parse(base_url)?;
     let host = parsed
         .host_str()
         .ok_or_else(|| format!("No host in URL: {base_url}"))?
         .to_lowercase();
+    let context_path = parsed.path().trim_matches('/').to_owned();
     let container = container_path.trim_matches('/');
-    Ok((host, container))
+    Ok(UrlParts {
+        host,
+        context_path,
+        container,
+    })
 }
 
 /// Computes a cache key from connection parameters.
 ///
-/// The hostname is extracted via `Url::parse` and lowercased. The container
+/// The hostname is extracted via `Url::parse` and lowercased. The URL context
+/// path (e.g. `"labkey"` from `https://host/labkey`) is included to
+/// distinguish multiple `LabKey` instances on the same host. The container
 /// path is normalized by stripping leading/trailing `/`.
-/// Returns `"{hostname}|{container}|{schema}|{query}"`.
+///
+/// Returns `"{hostname}/{context_path}|{container}|{schema}|{query}"`, or
+/// `"{hostname}|{container}|{schema}|{query}"` when the context path is empty.
 pub(crate) fn cache_key(
     base_url: &str,
     container_path: &str,
     schema: &str,
     query: &str,
 ) -> Result<String, Box<dyn Error>> {
-    let (host, container) = parse_host_and_container(base_url, container_path)?;
-    Ok(format!("{host}|{container}|{schema}|{query}"))
+    let parts = parse_url_parts(base_url, container_path)?;
+    let host_part = if parts.context_path.is_empty() {
+        parts.host
+    } else {
+        format!("{}/{}", parts.host, parts.context_path)
+    };
+    Ok(format!(
+        "{host_part}|{container}|{schema}|{query}",
+        container = parts.container
+    ))
 }
 
 /// Computes the relative Parquet file path for a cache entry.
 ///
-/// Uses the same hostname extraction and container normalization as
-/// [`cache_key`]. Returns a path like `"host/container/schema/query.parquet"`
-/// or `"host/schema/query.parquet"` when the container is empty (root `/`).
+/// Uses the same URL parsing and container normalization as [`cache_key`].
+/// The context path from the base URL is included as a path segment to
+/// prevent collisions between `LabKey` instances on the same host.
+///
+/// Returns a path like `"host/ctx/container/schema/query.parquet"`, omitting
+/// empty segments (context path or container).
 pub(crate) fn parquet_relative_path(
     base_url: &str,
     container_path: &str,
     schema: &str,
     query: &str,
 ) -> Result<String, Box<dyn Error>> {
-    let (host, container) = parse_host_and_container(base_url, container_path)?;
-    if container.is_empty() {
-        Ok(format!("{host}/{schema}/{query}.parquet"))
-    } else {
-        Ok(format!("{host}/{container}/{schema}/{query}.parquet"))
+    let parts = parse_url_parts(base_url, container_path)?;
+    let mut segments = vec![parts.host.as_str()];
+    if !parts.context_path.is_empty() {
+        segments.push(&parts.context_path);
     }
+    if !parts.container.is_empty() {
+        segments.push(parts.container);
+    }
+    segments.push(schema);
+    let dir = segments.join("/");
+    Ok(format!("{dir}/{query}.parquet"))
 }
 
 pub(crate) struct CacheManager {
@@ -142,11 +180,25 @@ impl CacheManager {
     }
 
     /// Reads and deserialises `cache.json`. Returns an empty [`CacheFile`] if
-    /// the file is missing or unparseable.
+    /// the file is missing, unparseable, or from an incompatible cache version.
+    ///
+    /// When the on-disk version does not match [`CURRENT_CACHE_VERSION`], the
+    /// cache is treated as empty so that all entries are transparently
+    /// re-fetched. This avoids silent misinterpretation of stale cache formats
+    /// after an extension upgrade.
     fn read_cache_file(&self) -> CacheFile {
         let path = self.cache_json_path();
         match std::fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|_| CacheFile::empty()),
+            Ok(contents) => {
+                let file: CacheFile = match serde_json::from_str(&contents) {
+                    Ok(f) => f,
+                    Err(_) => return CacheFile::empty(),
+                };
+                if file.version != CURRENT_CACHE_VERSION {
+                    return CacheFile::empty();
+                }
+                file
+            }
             Err(_) => CacheFile::empty(),
         }
     }
@@ -344,7 +396,7 @@ mod tests {
             "People",
         )
         .expect("cache_key");
-        assert_eq!(key, "labkey.example.com|MyProject|lists|People");
+        assert_eq!(key, "labkey.example.com/labkey|MyProject|lists|People");
     }
 
     #[test]
@@ -356,7 +408,7 @@ mod tests {
             "People",
         )
         .expect("cache_key");
-        assert_eq!(key, "labkey.example.com|MyProject|lists|People");
+        assert_eq!(key, "labkey.example.com/labkey|MyProject|lists|People");
     }
 
     #[test]
@@ -390,10 +442,41 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_preserves_schema_and_query_case() {
+    fn cache_key_no_context_path() {
         let key = cache_key("https://labkey.example.com", "/proj", "MySchema", "MyQuery")
             .expect("cache_key");
         assert_eq!(key, "labkey.example.com|proj|MySchema|MyQuery");
+    }
+
+    #[test]
+    fn cache_key_preserves_schema_and_query_case() {
+        let key = cache_key(
+            "https://labkey.example.com/labkey",
+            "/proj",
+            "MySchema",
+            "MyQuery",
+        )
+        .expect("cache_key");
+        assert_eq!(key, "labkey.example.com/labkey|proj|MySchema|MyQuery");
+    }
+
+    #[test]
+    fn cache_key_distinguishes_context_paths_on_same_host() {
+        let a = cache_key(
+            "https://labkey.example.com/labkey",
+            "/Project",
+            "lists",
+            "People",
+        )
+        .expect("key a");
+        let b = cache_key(
+            "https://labkey.example.com/lims",
+            "/Project",
+            "lists",
+            "People",
+        )
+        .expect("key b");
+        assert_ne!(a, b, "different context paths should not collide");
     }
 
     #[test]
@@ -419,7 +502,10 @@ mod tests {
             "People",
         )
         .expect("parquet_relative_path");
-        assert_eq!(path, "labkey.example.com/MyProject/lists/People.parquet");
+        assert_eq!(
+            path,
+            "labkey.example.com/labkey/MyProject/lists/People.parquet"
+        );
     }
 
     #[test]
@@ -449,6 +535,28 @@ mod tests {
         let path = parquet_relative_path("https://LABKEY.Example.COM", "/proj", "s", "q")
             .expect("parquet_relative_path");
         assert_eq!(path, "labkey.example.com/proj/s/q.parquet");
+    }
+
+    #[test]
+    fn parquet_relative_path_distinguishes_context_paths_on_same_host() {
+        let a = parquet_relative_path(
+            "https://labkey.example.com/labkey",
+            "/Project",
+            "lists",
+            "People",
+        )
+        .expect("path a");
+        let b = parquet_relative_path(
+            "https://labkey.example.com/lims",
+            "/Project",
+            "lists",
+            "People",
+        )
+        .expect("path b");
+        assert_ne!(
+            a, b,
+            "different context paths should not share parquet paths"
+        );
     }
 
     #[test]
@@ -762,10 +870,39 @@ mod tests {
     #[test]
     fn read_cache_file_tolerates_extra_fields() {
         let (mgr, _dir) = test_manager();
-        let json = r#"{"version": 2, "entries": {}, "new_field": "surprise"}"#;
+        let json = format!(
+            r#"{{"version": {CURRENT_CACHE_VERSION}, "entries": {{}}, "new_field": "surprise"}}"#,
+        );
         std::fs::write(mgr.cache_json_path(), json).expect("write");
         let file = mgr.read_cache_file();
         assert!(file.entries.is_empty());
-        assert_eq!(file.version, 2);
+        assert_eq!(file.version, CURRENT_CACHE_VERSION);
+    }
+
+    #[test]
+    fn read_cache_file_rejects_future_version() {
+        let (mgr, _dir) = test_manager();
+        let json = format!(
+            r#"{{"version": {}, "entries": {{}}}}"#,
+            CURRENT_CACHE_VERSION + 1
+        );
+        std::fs::write(mgr.cache_json_path(), json).expect("write");
+        let file = mgr.read_cache_file();
+        assert_eq!(
+            file.version, CURRENT_CACHE_VERSION,
+            "incompatible version should return a fresh empty CacheFile"
+        );
+        assert!(file.entries.is_empty());
+    }
+
+    #[test]
+    fn read_cache_file_rejects_past_version() {
+        let (mgr, _dir) = test_manager();
+        // Version 0 should also be rejected if CURRENT_CACHE_VERSION > 0.
+        let json = r#"{"version": 0, "entries": {}}"#;
+        std::fs::write(mgr.cache_json_path(), json).expect("write");
+        let file = mgr.read_cache_file();
+        assert_eq!(file.version, CURRENT_CACHE_VERSION);
+        assert!(file.entries.is_empty());
     }
 }

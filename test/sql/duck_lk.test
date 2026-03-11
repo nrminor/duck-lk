@@ -11,6 +11,11 @@ SELECT * FROM labkey_query('core', 'users');
 ----
 No LabKey base URL
 
+# labkey_query with an unreachable base_url produces a network error (not a panic)
+statement error
+SELECT * FROM labkey_query('core', 'users', base_url := 'http://127.0.0.1:1');
+----
+
 # labkey_cache_info returns an empty result set when nothing is cached
 query TTTTIITTTT
 SELECT * FROM labkey_cache_info();

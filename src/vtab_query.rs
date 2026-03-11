@@ -47,9 +47,10 @@ pub(crate) struct LabkeyBindData {
     schema_name: String,
     /// `LabKey` query name (positional param 1).
     query_name: String,
-    /// Whether to skip staleness check and serve only from cache.
-    // TODO: read this field in init() to skip staleness checks when true.
-    #[allow(dead_code)]
+    /// Whether to skip staleness check and serve only from cache. Currently
+    /// resolved entirely in `bind()`, but retained for future use in `init()`
+    /// (e.g. to suppress network retries on cache-miss recovery).
+    #[cfg_attr(not(test), allow(dead_code))]
     offline: bool,
     /// Path to the Parquet file to read (set after cache resolution).
     /// `Some` = cache hit, `None` = cache miss / stale.
@@ -458,9 +459,10 @@ fn fetch_and_cache(bind_data: &LabkeyBindData) -> Result<arrow_array::RecordBatc
 
 /// Writes an `Int64` Arrow column to a `DuckDB` `FlatVector`.
 ///
-/// Uses a two-pass approach: first writes all values (with 0 for null slots),
-/// then marks null positions via `set_null`. This avoids holding `&mut slice`
-/// and calling `&mut self` methods on the vector simultaneously.
+/// When the column has no nulls, uses `copy_from_slice` to memcpy the entire
+/// chunk in one operation. Otherwise falls back to a two-pass approach: first
+/// writes all values (with 0 for null slots), then marks null positions via
+/// `set_null`.
 fn write_i64_column(
     vector: &mut duckdb::core::FlatVector,
     array: &dyn Array,
@@ -472,19 +474,32 @@ fn write_i64_column(
         .downcast_ref::<Int64Array>()
         .ok_or("Column type mismatch: expected Int64Array in RecordBatch")?;
     let slice = vector.as_mut_slice::<i64>();
-    for (i, slot) in slice.iter_mut().enumerate().take(chunk_size) {
-        let src = offset + i;
-        *slot = if arr.is_null(src) { 0 } else { arr.value(src) };
-    }
-    for i in 0..chunk_size {
-        if arr.is_null(offset + i) {
-            vector.set_null(i);
+    if arr.null_count() == 0 {
+        let src = &arr.values().as_ref()[offset..offset + chunk_size];
+        slice[..chunk_size].copy_from_slice(src);
+    } else {
+        for (i, slot) in slice.iter_mut().enumerate().take(chunk_size) {
+            let src_idx = offset + i;
+            *slot = if arr.is_null(src_idx) {
+                0
+            } else {
+                arr.value(src_idx)
+            };
+        }
+        for i in 0..chunk_size {
+            if arr.is_null(offset + i) {
+                vector.set_null(i);
+            }
         }
     }
     Ok(())
 }
 
 /// Writes a `Float64` Arrow column to a `DuckDB` `FlatVector`.
+///
+/// When the column has no nulls, uses `copy_from_slice` to memcpy the entire
+/// chunk in one operation. Otherwise falls back to per-element copy with null
+/// marking.
 fn write_f64_column(
     vector: &mut duckdb::core::FlatVector,
     array: &dyn Array,
@@ -496,17 +511,22 @@ fn write_f64_column(
         .downcast_ref::<Float64Array>()
         .ok_or("Column type mismatch: expected Float64Array in RecordBatch")?;
     let slice = vector.as_mut_slice::<f64>();
-    for (i, slot) in slice.iter_mut().enumerate().take(chunk_size) {
-        let src = offset + i;
-        *slot = if arr.is_null(src) {
-            0.0
-        } else {
-            arr.value(src)
-        };
-    }
-    for i in 0..chunk_size {
-        if arr.is_null(offset + i) {
-            vector.set_null(i);
+    if arr.null_count() == 0 {
+        let src = &arr.values().as_ref()[offset..offset + chunk_size];
+        slice[..chunk_size].copy_from_slice(src);
+    } else {
+        for (i, slot) in slice.iter_mut().enumerate().take(chunk_size) {
+            let src_idx = offset + i;
+            *slot = if arr.is_null(src_idx) {
+                0.0
+            } else {
+                arr.value(src_idx)
+            };
+        }
+        for i in 0..chunk_size {
+            if arr.is_null(offset + i) {
+                vector.set_null(i);
+            }
         }
     }
     Ok(())
@@ -541,6 +561,11 @@ fn write_bool_column(
 }
 
 /// Writes a `TimestampMicrosecond` Arrow column to a `DuckDB` `FlatVector`.
+///
+/// When the column has no nulls, reads directly from the Arrow values buffer
+/// without per-element null checks. The type mismatch between `i64` and
+/// `duckdb_timestamp { micros: i64 }` prevents a raw `copy_from_slice`, but
+/// eliminating the branch per element is still a significant win at scale.
 fn write_timestamp_column(
     vector: &mut duckdb::core::FlatVector,
     array: &dyn Array,
@@ -552,25 +577,37 @@ fn write_timestamp_column(
         .downcast_ref::<TimestampMicrosecondArray>()
         .ok_or("Column type mismatch: expected TimestampMicrosecondArray in RecordBatch")?;
     let slice = vector.as_mut_slice::<duckdb_timestamp>();
-    for (i, slot) in slice.iter_mut().enumerate().take(chunk_size) {
-        let src = offset + i;
-        *slot = if arr.is_null(src) {
-            duckdb_timestamp { micros: 0 }
-        } else {
-            duckdb_timestamp {
-                micros: arr.value(src),
+    if arr.null_count() == 0 {
+        let values = arr.values();
+        for (i, slot) in slice.iter_mut().enumerate().take(chunk_size) {
+            slot.micros = values[offset + i];
+        }
+    } else {
+        for (i, slot) in slice.iter_mut().enumerate().take(chunk_size) {
+            let src_idx = offset + i;
+            *slot = if arr.is_null(src_idx) {
+                duckdb_timestamp { micros: 0 }
+            } else {
+                duckdb_timestamp {
+                    micros: arr.value(src_idx),
+                }
+            };
+        }
+        for i in 0..chunk_size {
+            if arr.is_null(offset + i) {
+                vector.set_null(i);
             }
-        };
-    }
-    for i in 0..chunk_size {
-        if arr.is_null(offset + i) {
-            vector.set_null(i);
         }
     }
     Ok(())
 }
 
 /// Writes a `Date32` Arrow column to a `DuckDB` `FlatVector`.
+///
+/// When the column has no nulls, reads directly from the Arrow values buffer
+/// without per-element null checks. The type mismatch between `i32` and
+/// `duckdb_date { days: i32 }` prevents a raw `copy_from_slice`, but
+/// eliminating the branch per element is still a significant win at scale.
 fn write_date_column(
     vector: &mut duckdb::core::FlatVector,
     array: &dyn Array,
@@ -582,19 +619,26 @@ fn write_date_column(
         .downcast_ref::<Date32Array>()
         .ok_or("Column type mismatch: expected Date32Array in RecordBatch")?;
     let slice = vector.as_mut_slice::<duckdb_date>();
-    for (i, slot) in slice.iter_mut().enumerate().take(chunk_size) {
-        let src = offset + i;
-        *slot = if arr.is_null(src) {
-            duckdb_date { days: 0 }
-        } else {
-            duckdb_date {
-                days: arr.value(src),
+    if arr.null_count() == 0 {
+        let values = arr.values();
+        for (i, slot) in slice.iter_mut().enumerate().take(chunk_size) {
+            slot.days = values[offset + i];
+        }
+    } else {
+        for (i, slot) in slice.iter_mut().enumerate().take(chunk_size) {
+            let src_idx = offset + i;
+            *slot = if arr.is_null(src_idx) {
+                duckdb_date { days: 0 }
+            } else {
+                duckdb_date {
+                    days: arr.value(src_idx),
+                }
+            };
+        }
+        for i in 0..chunk_size {
+            if arr.is_null(offset + i) {
+                vector.set_null(i);
             }
-        };
-    }
-    for i in 0..chunk_size {
-        if arr.is_null(offset + i) {
-            vector.set_null(i);
         }
     }
     Ok(())
@@ -714,5 +758,132 @@ mod tests {
         ];
         let result = filter_columns(fields);
         assert!(result.is_empty());
+    }
+
+    // -- bind_data_from_cache tests --
+
+    fn sample_cache_entry() -> cache::CacheEntry {
+        cache::CacheEntry {
+            parquet_path: "labkey.example.com/labkey/Project/lists/People.parquet".into(),
+            fetched_at: "2026-03-10T12:00:00Z".into(),
+            server_modified: Some("2026-03-10T11:00:00Z".into()),
+            row_count: 2,
+            size_bytes: 123,
+            base_url: "https://labkey.example.com/labkey".into(),
+            container_path: "/Project".into(),
+            schema_name: "lists".into(),
+            query_name: "People".into(),
+            columns: vec![
+                cache::CacheColumn {
+                    name: "Id".into(),
+                    json_type: Some("int".into()),
+                },
+                cache::CacheColumn {
+                    name: "Created".into(),
+                    json_type: Some("dateTime".into()),
+                },
+                cache::CacheColumn {
+                    name: "Label".into(),
+                    json_type: None,
+                },
+            ],
+        }
+    }
+
+    fn guest_config() -> credential::ResolvedConfig {
+        credential::ResolvedConfig {
+            base_url: "https://labkey.example.com/labkey".into(),
+            container_path: "/Project".into(),
+            credential: labkey_rs::Credential::Guest,
+        }
+    }
+
+    #[test]
+    fn bind_data_from_cache_populates_column_names_and_types() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = cache::CacheManager::with_dir(dir.path().to_path_buf()).expect("CacheManager");
+        let entry = sample_cache_entry();
+
+        let bind = bind_data_from_cache(
+            guest_config(),
+            &entry,
+            &mgr,
+            "lists".into(),
+            "People".into(),
+            false,
+        );
+
+        assert_eq!(bind.column_names, vec!["Id", "Created", "Label"]);
+        assert_eq!(
+            bind.column_types,
+            vec![
+                LogicalTypeId::Bigint,
+                LogicalTypeId::Timestamp,
+                LogicalTypeId::Varchar,
+            ]
+        );
+        assert_eq!(bind.schema_name, "lists");
+        assert_eq!(bind.query_name, "People");
+        assert!(!bind.offline);
+        assert!(bind.parquet_path.is_some());
+    }
+
+    #[test]
+    fn bind_data_from_cache_sets_offline_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = cache::CacheManager::with_dir(dir.path().to_path_buf()).expect("CacheManager");
+        let entry = sample_cache_entry();
+
+        let bind = bind_data_from_cache(
+            guest_config(),
+            &entry,
+            &mgr,
+            "lists".into(),
+            "People".into(),
+            true,
+        );
+
+        assert!(bind.offline);
+    }
+
+    #[test]
+    fn bind_data_from_cache_maps_unknown_types_to_varchar() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mgr = cache::CacheManager::with_dir(dir.path().to_path_buf()).expect("CacheManager");
+
+        let entry = cache::CacheEntry {
+            parquet_path: "host/s/q.parquet".into(),
+            fetched_at: "2026-03-10T12:00:00Z".into(),
+            server_modified: None,
+            row_count: 0,
+            size_bytes: 0,
+            base_url: "https://host".into(),
+            container_path: "/".into(),
+            schema_name: "s".into(),
+            query_name: "q".into(),
+            columns: vec![
+                cache::CacheColumn {
+                    name: "T".into(),
+                    json_type: Some("time".into()),
+                },
+                cache::CacheColumn {
+                    name: "X".into(),
+                    json_type: Some("mystery".into()),
+                },
+            ],
+        };
+
+        let config = credential::ResolvedConfig {
+            base_url: "https://host".into(),
+            container_path: "/".into(),
+            credential: labkey_rs::Credential::Guest,
+        };
+
+        let bind = bind_data_from_cache(config, &entry, &mgr, "s".into(), "q".into(), false);
+
+        assert_eq!(
+            bind.column_types,
+            vec![LogicalTypeId::Varchar, LogicalTypeId::Varchar]
+        );
     }
 }
