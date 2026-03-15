@@ -1,116 +1,169 @@
-# DuckDB Rust extension template
-This is an **experimental** template for Rust based extensions based on the C Extension API of DuckDB. The goal is to
-turn this eventually into a stable basis for pure-Rust DuckDB extensions that can be submitted to the Community extensions
-repository
+# duck-lk
 
-Features:
-- No DuckDB build required
-- No C++ or C code required
-- CI/CD chain preconfigured
-- (Coming soon) Works with community extensions
+A DuckDB extension for querying [LabKey Server](https://www.labkey.org/) tables with automatic local Parquet caching. LabKey's web interface can be painfully slow for exploring large tables; this extension lets you pull that data into DuckDB's fast analytics engine, where you can filter, join, aggregate, and explore interactively. Cached data is served from local Parquet files on subsequent queries, and automatic staleness detection ensures the cache stays fresh.
 
-## Cloning
+The extension is strictly read-only — it never writes back to LabKey.
 
-Clone the repo with submodules
+## Installation
 
-```shell
-git clone --recurse-submodules <repo>
+<!--
+### From the DuckDB Community Extensions (recommended)
+
+```sql
+INSTALL duck_lk FROM community;
+LOAD duck_lk;
 ```
+-->
 
-## Dependencies
-In principle, these extensions can be compiled with the Rust toolchain alone. However, this template relies on some additional
-tooling to make life a little easier and to be able to share CI/CD infrastructure with extension templates for other languages:
+### From a local build
 
-- Python3
-- Python3-venv
-- [Make](https://www.gnu.org/software/make)
-- Git
+Building from source requires [Nix](https://nixos.org/) with flakes enabled (recommended) or a manual toolchain with Rust, Python 3, Make, and Git.
 
-Installing these dependencies will vary per platform:
-- For Linux, these come generally pre-installed or are available through the distro-specific package manager.
-- For MacOS, [homebrew](https://formulae.brew.sh/).
-- For Windows, [chocolatey](https://community.chocolatey.org/).
+```bash
+git clone --recurse-submodules https://github.com/nrminor/duck-lk.git
+cd duck-lk
 
-## Building
-After installing the dependencies, building is a two-step process. Firstly run:
-```shell
+# With Nix (sets up the full toolchain automatically):
+nix develop
+
+# Then:
 make configure
+make debug    # or: make release
 ```
-This will ensure a Python venv is set up with DuckDB and DuckDB's test runner installed. Additionally, depending on configuration,
-DuckDB will be used to determine the correct platform for which you are compiling.
 
-Then, to build the extension run:
-```shell
-make debug
-```
-This delegates the build process to cargo, which will produce a shared library in `target/debug/<shared_lib_name>`. After this step,
-a script is run to transform the shared library into a loadable extension by appending a binary footer. The resulting extension is written
-to the `build/debug` directory.
+Load the extension in DuckDB with the `-unsigned` flag (required for local builds):
 
-To create optimized release binaries, simply run `make release` instead.
-
-### Running the extension
-To run the extension code, start `duckdb` with `-unsigned` flag. This will allow you to load the local extension file.
-
-```sh
+```bash
 duckdb -unsigned
 ```
 
-After loading the extension by the file path, you can use the functions provided by the extension (in this case, `rusty_quack()`).
+```sql
+LOAD 'build/debug/extension/duck_lk/duck_lk.duckdb_extension';
+```
+
+## Quick start
+
+Set your LabKey connection details as environment variables:
+
+```bash
+export LABKEY_BASE_URL="https://labkey.example.com"
+export LABKEY_CONTAINER_PATH="/MyProject"
+export LABKEY_API_KEY="your-api-key"
+```
+
+Then query any LabKey table by schema and query name:
 
 ```sql
-LOAD './build/debug/extension/rusty_quack/rusty_quack.duckdb_extension';
-SELECT * FROM rusty_quack('Jane');
+SELECT * FROM labkey_query('lists', 'People');
 ```
 
-```
-┌─────────────────────┐
-│       column0       │
-│       varchar       │
-├─────────────────────┤
-│ Rusty Quack Jane 🐥 │
-└─────────────────────┘
+The first call fetches data from the server and caches it locally as Parquet. Subsequent calls serve from cache unless the server data has changed.
+
+### Finding your schema and query names
+
+If you can see a table in the LabKey web UI, the URL contains the information you need. For a URL like:
+
+```text
+https://labkey.example.com/MyProject/list-grid.view?name=People
 ```
 
-## Testing
-This extension uses the DuckDB Python client for testing. This should be automatically installed in the `make configure` step.
-The tests themselves are written in the SQLLogicTest format, just like most of DuckDB's tests. A sample test can be found in
-`test/sql/<extension_name>.test`. To run the tests using the *debug* build:
+- **Base URL**: `https://labkey.example.com` (everything before the container path)
+- **Container path**: `/MyProject` (the project/folder path)
+- **Schema**: `lists` (derived from `list-grid.view`)
+- **Query name**: `People` (the `name` parameter)
 
-```shell
-make test_debug
-```
+Common schema names include `lists`, `core`, `study`, and `assay`.
 
-or for the *release* build:
-```shell
-make test_release
-```
+## Table functions
 
-### Version switching
-Testing with different DuckDB versions is really simple:
+### `labkey_query` — query LabKey data
 
-First, run
-```
-make clean_all
-```
-to ensure the previous `make configure` step is deleted.
+```sql
+-- Minimal (connection details from environment variables):
+SELECT * FROM labkey_query('lists', 'People');
 
-Then, run
-```
-DUCKDB_TEST_VERSION=v1.3.2 make configure
-```
-to select a different duckdb version to test with
+-- With explicit connection parameters:
+SELECT * FROM labkey_query('lists', 'People',
+    base_url = 'https://labkey.example.com',
+    container_path = '/MyProject',
+    api_key = 'your-api-key'
+);
 
-Finally, build and test with
-```
-make debug
-make test_debug
+-- Offline mode (cache only, no network):
+SELECT * FROM labkey_query('lists', 'People', offline = true);
 ```
 
-### Known issues
-This is a bit of a footgun, but the extensions produced by this template may (or may not) be broken on windows on python3.11
-with the following error on extension load:
-```shell
-IO Error: Extension '<name>.duckdb_extension' could not be loaded: The specified module could not be found
+Positional parameters:
+
+| Parameter     | Type    | Description                                         |
+| ------------- | ------- | --------------------------------------------------- |
+| `schema_name` | VARCHAR | LabKey schema (e.g. `'lists'`, `'core'`, `'study'`) |
+| `query_name`  | VARCHAR | Table or query name within the schema               |
+
+Named parameters:
+
+| Parameter        | Type    | Default | Description                                 |
+| ---------------- | ------- | ------- | ------------------------------------------- |
+| `base_url`       | VARCHAR |         | LabKey server URL                           |
+| `container_path` | VARCHAR | `"/"`   | LabKey project/folder path                  |
+| `api_key`        | VARCHAR |         | API key for authentication                  |
+| `offline`        | BOOLEAN | `false` | Skip staleness check, serve only from cache |
+
+### `labkey_cache_info` — inspect the cache
+
+```sql
+SELECT * FROM labkey_cache_info();
 ```
-This was resolved by using python 3.12
+
+Returns one row per cached table with columns: `base_url`, `container_path`, `schema_name`, `query_name`, `row_count`, `size_bytes`, `fetched_at`, `server_modified`, `staleness_check`, and `parquet_path`.
+
+### `labkey_cache_clear` — manage the cache
+
+```sql
+-- Clear a specific table's cache:
+CALL labkey_cache_clear(schema = 'lists', query = 'People');
+
+-- Clear all cached data:
+CALL labkey_cache_clear();
+```
+
+Returns a status message with details about what was cleared.
+
+## Credential resolution
+
+Credentials are resolved using a precedence chain — the first source that provides a value wins:
+
+1. **Named SQL parameters** (`api_key`, `base_url`, `container_path`)
+2. **Environment variables** (`LABKEY_API_KEY`, `LABKEY_BASE_URL`, `LABKEY_CONTAINER_PATH`)
+3. **`.netrc` file** (matched by hostname from the resolved base URL)
+4. **Guest access** (no credentials — only works if the server permits anonymous reads)
+
+The base URL is required. If it isn't provided by any source, the query returns an error explaining the available configuration methods.
+
+## Cache behavior
+
+Fetched data is cached as Parquet files in the platform-specific cache directory:
+
+- **macOS**: `~/Library/Caches/duck-lk/`
+- **Linux**: `~/.cache/duck-lk/`
+- **Windows**: `%LOCALAPPDATA%/duck-lk/`
+
+The directory structure mirrors the LabKey hierarchy (`{hostname}/{container}/{schema}/{query}.parquet`), making it easy to inspect cached files directly.
+
+On each query, the extension checks whether the LabKey table has been modified since the last fetch by comparing `MAX(Modified)` timestamps. If the data is stale, it transparently re-fetches. Tables without a `Modified` column skip this check and serve from cache until manually cleared.
+
+## Building from source
+
+The development environment is managed with a Nix flake. Running `nix develop` (or allowing direnv to activate the `.envrc`) provides Rust 1.90.0, DuckDB, Python 3, Make, and all build dependencies.
+
+Available make targets:
+
+| Target         | Description                        |
+| -------------- | ---------------------------------- |
+| `make debug`   | Build debug extension binary       |
+| `make release` | Build optimized release binary     |
+| `make check`   | Run `cargo fmt` and `cargo clippy` |
+| `make test`    | Run SQL logic tests (debug build)  |
+| `make clean`   | Remove build artifacts             |
+
+The extension uses pedantic Clippy lints with `unwrap_used = "deny"`.
