@@ -93,15 +93,25 @@ pub(crate) fn parse_datetime_micros(s: &str) -> Option<i64> {
 
 /// Parses a date string from `LabKey` into days since the Unix epoch.
 ///
-/// Tries `%Y-%m-%d` and `%m/%d/%Y` formats.
+/// Tries date-only formats first (`%Y-%m-%d`, `%m/%d/%Y`), then falls back
+/// to datetime formats and extracts the date component. This handles servers
+/// that send date columns as datetime strings like `"2023-12-05 00:00:00.000"`.
+///
 /// Returns `None` if parsing fails.
 #[must_use]
 pub(crate) fn parse_date_days(s: &str) -> Option<i32> {
     let epoch = NaiveDate::from_ymd_opt(1970, 1, 1)?;
+    let normalized = s.strip_suffix('Z').unwrap_or(s);
 
     DATE_ONLY_FORMATS
         .iter()
-        .find_map(|fmt| NaiveDate::parse_from_str(s, fmt).ok())
+        .find_map(|fmt| NaiveDate::parse_from_str(normalized, fmt).ok())
+        .or_else(|| {
+            DATETIME_FORMATS
+                .iter()
+                .find_map(|fmt| NaiveDateTime::parse_from_str(normalized, fmt).ok())
+                .map(|dt| dt.date())
+        })
         .and_then(|d| i32::try_from((d - epoch).num_days()).ok())
 }
 
@@ -528,6 +538,23 @@ mod tests {
     fn date_pre_epoch() {
         let days = parse_date_days("1969-12-31");
         assert_eq!(days, Some(-1));
+    }
+
+    #[test]
+    fn date_from_datetime_string() {
+        // LabKey servers sometimes send date columns as datetime strings
+        assert_eq!(
+            parse_date_days("2023-12-05 00:00:00.000"),
+            parse_date_days("2023-12-05")
+        );
+    }
+
+    #[test]
+    fn date_from_iso_datetime_string() {
+        assert_eq!(
+            parse_date_days("2024-01-15T09:30:00.000Z"),
+            parse_date_days("2024-01-15")
+        );
     }
 
     #[test]
