@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build extension binaries
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
+    with:
+      duckdb_version: v1.4.4
+      ci_tools_version: main
+      extension_name: duck_lk
+      extra_toolchains: rust;python3
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;linux_amd64_musl;windows_amd64_mingw;windows_amd64_rtools'
+
+  release:
+    name: Create GitHub Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Package extension artifacts
+        run: |
+          mkdir -p release/
+          for dir in artifacts/duck_lk-*; do
+            arch="${dir##*extension-}"
+            find "$dir" -name "*.duckdb_extension" | while read -r ext; do
+              cp "$ext" "release/duck_lk-${arch}.duckdb_extension"
+              echo "Packaged: duck_lk-${arch}.duckdb_extension"
+            done
+          done
+          ls -lh release/
+
+      - name: Create Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ github.ref_name }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+- ]]; then
+            echo "Creating pre-release for ${{ github.ref_name }}"
+            gh release create "${{ github.ref_name }}" \
+              --title "duck-lk ${{ github.ref_name }}" \
+              --notes "Pre-built DuckDB extension binaries for duck-lk ${{ github.ref_name }}." \
+              --prerelease \
+              release/*
+          else
+            echo "Creating release for ${{ github.ref_name }}"
+            gh release create "${{ github.ref_name }}" \
+              --title "duck-lk ${{ github.ref_name }}" \
+              --notes "Pre-built DuckDB extension binaries for duck-lk ${{ github.ref_name }}." \
+              release/*
+          fi
