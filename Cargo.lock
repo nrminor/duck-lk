@@ -1247,7 +1247,8 @@ dependencies = [
 [[package]]
 name = "labkey-rs"
 version = "0.1.0"
-source = "git+https://github.com/nrminor/labkey-rs.git?rev=4f63e469#4f63e469e6ac56f2d5f960f8fd57caf69d15498d"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "71ec646df2d1c4380ed7f920e90d837768f5c05b6e70e2432cf9aaf8703dd417"
 dependencies = [
  "base64",
  "bon",

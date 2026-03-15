@@ -27,7 +27,7 @@ arrow-select = "56"
 chrono = "0.4"
 dirs = "6"
 duckdb = { version = "=1.4.4", features = ["loadable-extension"] }
-labkey-rs = { git = "https://github.com/nrminor/labkey-rs.git", rev = "4f63e469" }
+labkey-rs = "0.1.0"
 libduckdb-sys = "=1.4.4"
 parquet = { version = "56", default-features = false, features = ["arrow"] }
 serde = { version = "1", features = ["derive"] }
