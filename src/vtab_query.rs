@@ -13,6 +13,7 @@
 use std::{
     error::Error,
     sync::atomic::{AtomicUsize, Ordering},
+    time::{Duration, Instant},
 };
 
 use arrow_array::{
@@ -23,6 +24,7 @@ use duckdb::{
     core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId},
     vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab},
 };
+use indicatif::{ProgressBar, ProgressStyle};
 use labkey_rs::{
     query::{QueryColumn, SelectRowsOptions, ShowRows},
     ClientConfig, LabkeyClient,
@@ -391,8 +393,23 @@ fn fetch_and_cache(bind_data: &LabkeyBindData) -> Result<arrow_array::RecordBatc
         .schema_name(bind_data.schema_name.clone())
         .query_name(bind_data.query_name.clone())
         .include_metadata(true)
+        .show_rows(ShowRows::All)
         .build();
+
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    spinner.set_message(format!(
+        "Fetching {}.{} from LabKey...",
+        bind_data.schema_name, bind_data.query_name
+    ));
+    spinner.enable_steady_tick(Duration::from_millis(100));
+
+    let started = Instant::now();
     let data_response = rt.block_on(client.select_rows(data_opts))?;
+    let elapsed = started.elapsed();
 
     let meta_data = data_response
         .meta_data
@@ -400,6 +417,14 @@ fn fetch_and_cache(bind_data: &LabkeyBindData) -> Result<arrow_array::RecordBatc
     let filtered_columns = filter_columns(meta_data.fields);
 
     let batch = types::rows_to_record_batch(&data_response.rows, &filtered_columns)?;
+
+    spinner.finish_with_message(format!(
+        "Fetched {} rows from {}.{} ({:.1}s)",
+        batch.num_rows(),
+        bind_data.schema_name,
+        bind_data.query_name,
+        elapsed.as_secs_f64(),
+    ));
 
     let mgr = cache::CacheManager::new()?;
     let key = cache::cache_key(
