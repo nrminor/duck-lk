@@ -1,6 +1,10 @@
 # duck-lk
 
-A DuckDB extension for querying [LabKey Server](https://www.labkey.org/) tables with automatic local Parquet caching. LabKey's web interface can be painfully slow for exploring large tables; this extension lets you pull that data into DuckDB's fast analytics engine, where you can filter, join, aggregate, and explore interactively. Cached data is served from local Parquet files on subsequent queries, and automatic staleness detection ensures the cache stays fresh.
+A DuckDB extension that brings the full power of a modern analytical SQL engine to your [LabKey Server](https://www.labkey.org/) data.
+
+LabKey's web interface struggles with large tables — slow page loads, limited filtering, no joins across tables, no aggregations beyond what the UI offers. duck-lk solves this by synchronizing LabKey tables into local [Parquet](https://parquet.apache.org/) files and exposing them through DuckDB, where you get columnar compression, vectorized execution, window functions, CTEs, cross-table joins, and the full DuckDB SQL dialect. A table that takes minutes to page through in the LabKey UI can be scanned, filtered, and aggregated in seconds.
+
+The synchronization is automatic and transparent: the first query fetches the full table from LabKey and caches it as Parquet. Subsequent queries read directly from the local cache with no network overhead. Staleness detection ensures the cache stays fresh — if the server data has changed, the extension re-fetches automatically (though with escape hatches for the user).
 
 The extension is strictly read-only — it never writes back to LabKey.
 
@@ -151,6 +155,18 @@ Fetched data is cached as Parquet files in the platform-specific cache directory
 The directory structure mirrors the LabKey hierarchy (`{hostname}/{container}/{schema}/{query}.parquet`), making it easy to inspect cached files directly.
 
 On each query, the extension checks whether the LabKey table has been modified since the last fetch by comparing `MAX(Modified)` timestamps. If the data is stale, it transparently re-fetches. Tables without a `Modified` column skip this check and serve from cache until manually cleared.
+
+## How it works
+
+The extension operates in two phases: **fetch** and **query**.
+
+On the first call to `labkey_query` for a given table, the extension fetches the entire table from LabKey via the REST API and writes it to a local Parquet file. This initial fetch takes time proportional to the table size — there is no server-side filtering, since the goal is to create a complete local copy for fast analytical access.
+
+Once cached, all subsequent queries hit the local Parquet file with DuckDB's full query optimizer: columnar reads, row group skipping, predicate pushdown, and vectorized execution. This is where the performance payoff lives — queries that would be impossible in LabKey's web UI (joins across tables, window functions, complex aggregations) run in seconds against the local cache.
+
+**Disk usage.** Parquet is a compressed columnar format, so cache files are typically much smaller than the raw data. Still, large tables produce proportionally large files. Use `labkey_cache_info()` to monitor cache size and `labkey_cache_clear()` to reclaim space when you're done.
+
+**SQL dialect.** Once data is in DuckDB, you query it with [DuckDB SQL](https://duckdb.org/docs/sql/introduction) — not LabKey SQL (used in LabKey's web query editor) or PostgreSQL (which LabKey uses internally). DuckDB's dialect is rich: `COLUMNS(*)` expressions, `LIST` and `MAP` aggregates, `QUALIFY`, `EXCLUDE`/`REPLACE`, native Parquet/CSV/JSON I/O, and much more.
 
 ## Building from source
 

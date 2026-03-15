@@ -32,6 +32,11 @@
 !/.github/workflows/*.yml
 !/.github/workflows/*.yaml
 
+# agent skill
+!/skills
+!/skills/duck-lk
+!/skills/duck-lk/SKILL.md
+
 # extension-ci-tools submodule (managed by git submodules)
 !/extension-ci-tools
 
