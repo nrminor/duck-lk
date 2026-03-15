@@ -8,9 +8,6 @@
   },
   "permission": {
     "doom_loop": "allow",
-    "external_directory": {
-      "*": "deny"
-    },
     "bash": {
       "*": "allow",
 
