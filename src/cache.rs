@@ -16,6 +16,7 @@ use std::{
 };
 
 use arrow_array::RecordBatch;
+use arrow_schema::ArrowError;
 use arrow_schema::SchemaRef;
 use arrow_select::concat::concat_batches;
 use labkey_rs::query::ExecuteSqlOptions;
@@ -63,6 +64,9 @@ pub(crate) struct CacheColumn {
     pub(crate) name: String,
     pub(crate) json_type: Option<String>,
 }
+
+pub(crate) type ParquetBatchIterator =
+    Box<dyn Iterator<Item = Result<RecordBatch, ArrowError>> + Send>;
 
 /// Incremental Parquet writer with atomic temp-file + rename semantics.
 ///
@@ -350,6 +354,7 @@ impl CacheManager {
     /// Reads a Parquet file into a single `RecordBatch` (concatenating row
     /// groups). Returns an empty batch with the correct schema when the file
     /// contains zero rows.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn read_parquet(path: &Path) -> Result<RecordBatch, Box<dyn Error>> {
         let file = std::fs::File::open(path)?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
@@ -361,6 +366,20 @@ impl CacheManager {
         }
         let batch = concat_batches(&arrow_schema, &batches)?;
         Ok(batch)
+    }
+
+    /// Opens a streaming Parquet batch reader with the requested Arrow batch
+    /// size. Unlike [`read_parquet`](Self::read_parquet), this does not
+    /// concatenate row groups into one in-memory `RecordBatch`.
+    pub(crate) fn open_parquet_batch_reader(
+        path: &Path,
+        batch_size: usize,
+    ) -> Result<ParquetBatchIterator, Box<dyn Error>> {
+        let file = std::fs::File::open(path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)?
+            .with_batch_size(batch_size)
+            .build()?;
+        Ok(Box::new(reader))
     }
 
     /// Checks whether the `LabKey` table has been modified since the cached
@@ -858,6 +877,31 @@ mod tests {
         assert_eq!(ages.value(0), 30);
         assert_eq!(ages.value(3), 41);
         assert_eq!(ages.value(4), 52);
+    }
+
+    #[test]
+    fn open_parquet_batch_reader_streams_multiple_batches() {
+        let (mgr, _dir) = test_manager();
+        let batch1 = sample_batch();
+        let batch2 = sample_batch_2();
+        let path = mgr.cache_dir.join("test/streaming.parquet");
+
+        let mut writer = IncrementalParquetWriter::try_new(&path, batch1.schema())
+            .expect("IncrementalParquetWriter::try_new");
+        writer.write(&batch1).expect("write batch1");
+        writer.write(&batch2).expect("write batch2");
+        writer.finish().expect("finish writer");
+
+        let reader =
+            CacheManager::open_parquet_batch_reader(&path, 2).expect("open_parquet_batch_reader");
+        let batches: Vec<RecordBatch> = reader
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect reader batches");
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].num_rows(), 2);
+        assert_eq!(batches[1].num_rows(), 2);
+        assert_eq!(batches[2].num_rows(), 1);
     }
 
     #[test]

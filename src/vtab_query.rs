@@ -12,7 +12,7 @@
 
 use std::{
     error::Error,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -61,16 +61,15 @@ pub(crate) struct LabkeyBindData {
 
 /// Init data for the `labkey_query` table function.
 ///
-/// Holds the fully-materialized `RecordBatch` (from cache or fresh fetch) and
-/// an atomic row offset for chunked output to `DuckDB`.
+/// Holds a streaming Parquet reader plus the current in-memory Arrow batch.
 pub(crate) struct LabkeyInitData {
-    /// All rows as a column-major Arrow `RecordBatch`.
-    record_batch: arrow_array::RecordBatch,
-    /// Current row offset (how many rows have been emitted so far).
-    /// Uses `AtomicUsize` because the `VTab` trait requires `Send + Sync` on
-    /// init data. Safe with `Relaxed` ordering because `set_max_threads(1)`
-    /// ensures single-threaded scanning.
-    row_offset: AtomicUsize,
+    stream: Mutex<ParquetStreamState>,
+}
+
+struct ParquetStreamState {
+    reader: cache::ParquetBatchIterator,
+    current_batch: Option<arrow_array::RecordBatch>,
+    row_offset: usize,
 }
 
 pub(crate) struct LabkeyQueryVTab;
@@ -205,17 +204,27 @@ impl VTab for LabkeyQueryVTab {
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
         let bind_data = unsafe { &*init.get_bind_data::<LabkeyBindData>() };
 
-        let record_batch = if let Some(ref path) = bind_data.parquet_path {
-            cache::CacheManager::read_parquet(path)?
+        let parquet_path = if let Some(ref path) = bind_data.parquet_path {
+            path.clone()
         } else {
             fetch_and_cache(bind_data)?
+        };
+
+        let mut reader = cache::CacheManager::open_parquet_batch_reader(&parquet_path, 2048)?;
+        let current_batch = match reader.next() {
+            Some(Ok(batch)) => Some(batch),
+            Some(Err(err)) => return Err(Box::new(err)),
+            None => None,
         };
 
         init.set_max_threads(1);
 
         Ok(LabkeyInitData {
-            record_batch,
-            row_offset: AtomicUsize::new(0),
+            stream: Mutex::new(ParquetStreamState {
+                reader,
+                current_batch,
+                row_offset: 0,
+            }),
         })
     }
 
@@ -226,60 +235,70 @@ impl VTab for LabkeyQueryVTab {
         let bind_data = func.get_bind_data();
         let init_data = func.get_init_data();
 
-        let offset = init_data.row_offset.load(Ordering::Relaxed);
-        let total_rows = init_data.record_batch.num_rows();
-        let remaining = total_rows.saturating_sub(offset);
+        let mut stream = init_data
+            .stream
+            .lock()
+            .map_err(|_| "Parquet stream mutex poisoned")?;
 
-        if remaining == 0 {
-            output.set_len(0);
-            return Ok(());
-        }
+        loop {
+            let Some(current_batch) = stream.current_batch.as_ref() else {
+                output.set_len(0);
+                return Ok(());
+            };
 
-        let chunk_size = std::cmp::min(2048, remaining);
+            let remaining = current_batch.num_rows().saturating_sub(stream.row_offset);
+            if remaining == 0 {
+                if !advance_to_next_batch(&mut stream)? {
+                    output.set_len(0);
+                    return Ok(());
+                }
+                continue;
+            }
 
-        debug_assert_eq!(
-            bind_data.column_names.len(),
-            bind_data.column_types.len(),
-            "column_names and column_types must have the same length"
-        );
-        debug_assert_eq!(
-            bind_data.column_names.len(),
-            init_data.record_batch.num_columns(),
-            "bind column count must match RecordBatch column count"
-        );
+            let offset = stream.row_offset;
+            let chunk_size = std::cmp::min(2048, remaining);
 
-        for col_idx in 0..bind_data.column_names.len() {
-            let array = init_data.record_batch.column(col_idx);
-            let mut vector = output.flat_vector(col_idx);
+            debug_assert_eq!(
+                bind_data.column_names.len(),
+                bind_data.column_types.len(),
+                "column_names and column_types must have the same length"
+            );
+            debug_assert_eq!(
+                bind_data.column_names.len(),
+                current_batch.num_columns(),
+                "bind column count must match RecordBatch column count"
+            );
 
-            match bind_data.column_types[col_idx] {
-                LogicalTypeId::Bigint => {
-                    write_i64_column(&mut vector, array, offset, chunk_size)?;
-                }
-                LogicalTypeId::Double => {
-                    write_f64_column(&mut vector, array, offset, chunk_size)?;
-                }
-                LogicalTypeId::Boolean => {
-                    write_bool_column(&mut vector, array, offset, chunk_size)?;
-                }
-                LogicalTypeId::Timestamp => {
-                    write_timestamp_column(&mut vector, array, offset, chunk_size)?;
-                }
-                LogicalTypeId::Date => {
-                    write_date_column(&mut vector, array, offset, chunk_size)?;
-                }
-                _ => {
-                    write_varchar_column(&mut vector, array, offset, chunk_size)?;
+            for col_idx in 0..bind_data.column_names.len() {
+                let array = current_batch.column(col_idx);
+                let mut vector = output.flat_vector(col_idx);
+
+                match bind_data.column_types[col_idx] {
+                    LogicalTypeId::Bigint => {
+                        write_i64_column(&mut vector, array, offset, chunk_size)?;
+                    }
+                    LogicalTypeId::Double => {
+                        write_f64_column(&mut vector, array, offset, chunk_size)?;
+                    }
+                    LogicalTypeId::Boolean => {
+                        write_bool_column(&mut vector, array, offset, chunk_size)?;
+                    }
+                    LogicalTypeId::Timestamp => {
+                        write_timestamp_column(&mut vector, array, offset, chunk_size)?;
+                    }
+                    LogicalTypeId::Date => {
+                        write_date_column(&mut vector, array, offset, chunk_size)?;
+                    }
+                    _ => {
+                        write_varchar_column(&mut vector, array, offset, chunk_size)?;
+                    }
                 }
             }
+
+            stream.row_offset += chunk_size;
+            output.set_len(chunk_size);
+            return Ok(());
         }
-
-        init_data
-            .row_offset
-            .store(offset + chunk_size, Ordering::Relaxed);
-        output.set_len(chunk_size);
-
-        Ok(())
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
@@ -509,8 +528,22 @@ fn fetch_pages_to_parquet(
     })
 }
 
-/// Fetches all rows from `LabKey`, writes them to the Parquet cache, and
-/// returns the resulting `RecordBatch`.
+fn advance_to_next_batch(state: &mut ParquetStreamState) -> Result<bool, Box<dyn Error>> {
+    match state.reader.next() {
+        Some(Ok(batch)) => {
+            state.current_batch = Some(batch);
+            state.row_offset = 0;
+            Ok(true)
+        }
+        Some(Err(err)) => Err(Box::new(err)),
+        None => {
+            state.current_batch = None;
+            state.row_offset = 0;
+            Ok(false)
+        }
+    }
+}
+
 #[allow(clippy::doc_markdown)]
 /// Syncs a LabKey table to the local Parquet cache and returns the path to
 /// the cached file. This is the shared implementation used by both
@@ -587,13 +620,12 @@ pub(crate) fn sync_to_cache(
     Ok(pq_path)
 }
 
-fn fetch_and_cache(bind_data: &LabkeyBindData) -> Result<arrow_array::RecordBatch, Box<dyn Error>> {
-    let pq_path = sync_to_cache(
+fn fetch_and_cache(bind_data: &LabkeyBindData) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    sync_to_cache(
         &bind_data.config,
         &bind_data.schema_name,
         &bind_data.query_name,
-    )?;
-    cache::CacheManager::read_parquet(&pq_path)
+    )
 }
 
 /// Writes an `Int64` Arrow column to a `DuckDB` `FlatVector`.
