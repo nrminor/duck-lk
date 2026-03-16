@@ -10,14 +10,12 @@ The extension is strictly read-only — it never writes back to LabKey.
 
 ## Installation
 
-<!--
 ### From the DuckDB Community Extensions (recommended)
 
 ```sql
 INSTALL duck_lk FROM community;
 LOAD duck_lk;
 ```
--->
 
 ### From a local build
 
