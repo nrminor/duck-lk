@@ -11,10 +11,12 @@
 use std::{
     collections::HashMap,
     error::Error,
+    fs::File,
     path::{Path, PathBuf},
 };
 
 use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use arrow_select::concat::concat_batches;
 use labkey_rs::query::ExecuteSqlOptions;
 use labkey_rs::LabkeyClient;
@@ -60,6 +62,69 @@ pub(crate) struct CacheEntry {
 pub(crate) struct CacheColumn {
     pub(crate) name: String,
     pub(crate) json_type: Option<String>,
+}
+
+/// Incremental Parquet writer with atomic temp-file + rename semantics.
+///
+/// Used for large-table ingestion so multiple `RecordBatch` values can be
+/// appended to a single Parquet file without materializing the entire table in
+/// memory first.
+pub(crate) struct IncrementalParquetWriter {
+    final_path: PathBuf,
+    tmp_path: PathBuf,
+    writer: Option<ArrowWriter<File>>,
+    finished: bool,
+}
+
+impl IncrementalParquetWriter {
+    /// Creates a new incremental writer for `path` using `schema`.
+    pub(crate) fn try_new(path: &Path, schema: SchemaRef) -> Result<Self, Box<dyn Error>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp_path = path.with_extension("parquet.tmp");
+        let file = File::create(&tmp_path)?;
+        let writer = ArrowWriter::try_new(file, schema, None)?;
+        Ok(Self {
+            final_path: path.to_path_buf(),
+            tmp_path,
+            writer: Some(writer),
+            finished: false,
+        })
+    }
+
+    /// Appends one `RecordBatch` to the Parquet file.
+    pub(crate) fn write(&mut self, batch: &RecordBatch) -> Result<(), Box<dyn Error>> {
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or("incremental parquet writer already finished")?;
+        writer.write(batch)?;
+        Ok(())
+    }
+
+    /// Finishes the Parquet file, atomically renames it into place, and returns
+    /// the final file size in bytes.
+    pub(crate) fn finish(mut self) -> Result<u64, Box<dyn Error>> {
+        let writer = self
+            .writer
+            .take()
+            .ok_or("incremental parquet writer already finished")?;
+        writer.close()?;
+        let size = std::fs::metadata(&self.tmp_path)?.len();
+        std::fs::rename(&self.tmp_path, &self.final_path)?;
+        self.finished = true;
+        Ok(size)
+    }
+}
+
+impl Drop for IncrementalParquetWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.writer.take();
+            let _ = std::fs::remove_file(&self.tmp_path);
+        }
+    }
 }
 
 /// Parsed URL components used for cache key and Parquet path construction.
@@ -270,17 +335,9 @@ impl CacheManager {
     /// The caller is responsible for constructing the full path (e.g. via
     /// [`parquet_path`](Self::parquet_path)).
     pub(crate) fn write_parquet(path: &Path, batch: &RecordBatch) -> Result<u64, Box<dyn Error>> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let tmp_path = path.with_extension("parquet.tmp");
-        let file = std::fs::File::create(&tmp_path)?;
-        let mut writer = ArrowWriter::try_new(file, batch.schema(), None)?;
+        let mut writer = IncrementalParquetWriter::try_new(path, batch.schema())?;
         writer.write(batch)?;
-        writer.close()?;
-        let size = std::fs::metadata(&tmp_path)?.len();
-        std::fs::rename(&tmp_path, path)?;
-        Ok(size)
+        writer.finish()
     }
 
     /// Reads a Parquet file into a single `RecordBatch` (concatenating row
@@ -380,6 +437,21 @@ mod tests {
             vec![
                 Arc::new(StringArray::from(vec![Some("Alice"), Some("Bob"), None])),
                 Arc::new(Int64Array::from(vec![Some(30), None, Some(25)])),
+            ],
+        )
+        .expect("RecordBatch")
+    }
+
+    fn sample_batch_2() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("Carol"), Some("Dave")])),
+                Arc::new(Int64Array::from(vec![Some(41), Some(52)])),
             ],
         )
         .expect("RecordBatch")
@@ -745,6 +817,43 @@ mod tests {
     }
 
     #[test]
+    fn incremental_writer_roundtrip_preserves_multiple_batches() {
+        let (mgr, _dir) = test_manager();
+        let batch1 = sample_batch();
+        let batch2 = sample_batch_2();
+        let path = mgr.cache_dir.join("test/incremental.parquet");
+
+        let mut writer = IncrementalParquetWriter::try_new(&path, batch1.schema())
+            .expect("IncrementalParquetWriter::try_new");
+        writer.write(&batch1).expect("write batch1");
+        writer.write(&batch2).expect("write batch2");
+        let size = writer.finish().expect("finish writer");
+        assert!(size > 0);
+
+        let read_batch = CacheManager::read_parquet(&path).expect("read_parquet");
+        assert_eq!(read_batch.num_rows(), 5);
+        assert_eq!(read_batch.num_columns(), 2);
+
+        let names = read_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("StringArray");
+        assert_eq!(names.value(0), "Alice");
+        assert_eq!(names.value(3), "Carol");
+        assert_eq!(names.value(4), "Dave");
+
+        let ages = read_batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64Array");
+        assert_eq!(ages.value(0), 30);
+        assert_eq!(ages.value(3), 41);
+        assert_eq!(ages.value(4), 52);
+    }
+
+    #[test]
     fn write_parquet_creates_parent_dirs() {
         let (mgr, _dir) = test_manager();
         let batch = sample_batch();
@@ -796,6 +905,31 @@ mod tests {
             "temp file should not linger after write"
         );
         assert!(path.exists(), "parquet file should exist");
+    }
+
+    #[test]
+    fn incremental_writer_drop_cleans_up_temp_file() {
+        let (mgr, _dir) = test_manager();
+        let batch = sample_batch();
+        let path = mgr.cache_dir.join("incremental_cleanup.parquet");
+
+        {
+            let mut writer = IncrementalParquetWriter::try_new(&path, batch.schema())
+                .expect("IncrementalParquetWriter::try_new");
+            writer.write(&batch).expect("write batch");
+            let tmp_path = path.with_extension("parquet.tmp");
+            assert!(tmp_path.exists(), "temp file should exist before drop");
+        }
+
+        let tmp_path = path.with_extension("parquet.tmp");
+        assert!(
+            !tmp_path.exists(),
+            "temp file should be cleaned up when writer is dropped"
+        );
+        assert!(
+            !path.exists(),
+            "final parquet file should not exist if finish() was never called"
+        );
     }
 
     #[test]
