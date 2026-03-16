@@ -36,6 +36,10 @@ use tokio::runtime::Runtime;
 
 use super::{cache, credential, types};
 
+const DEBUG_ENV_VAR: &str = "DUCK_LK_DEBUG";
+const FETCH_PAGE_SIZE_ROWS: i32 = 50_000;
+const FETCH_PROGRESS_TICK_MS: u64 = 100;
+
 /// Bind data for the `labkey_query` table function.
 ///
 /// Stores the resolved connection configuration, column schema, and cache
@@ -414,6 +418,35 @@ struct PaginatedFetchResult {
     elapsed: Duration,
 }
 
+struct FetchSession<'a> {
+    schema_name: &'a str,
+    query_name: &'a str,
+    client: &'a LabkeyClient,
+    runtime: &'a Runtime,
+}
+
+struct FetchProgress {
+    written_rows: usize,
+    total_rows: Option<usize>,
+    total_pages: Option<usize>,
+    page: usize,
+    next_offset: i64,
+    started: Instant,
+}
+
+struct FetchBootstrap {
+    filtered_columns: Vec<QueryColumn>,
+    columns: Vec<cache::CacheColumn>,
+    writer: cache::IncrementalParquetWriter,
+    progress: FetchProgress,
+}
+
+struct CacheWriteTarget {
+    key: String,
+    relative_path: String,
+    absolute_path: PathBuf,
+}
+
 fn debug_logging_enabled_value(value: Option<&str>) -> bool {
     value.is_some_and(|v| {
         matches!(
@@ -424,7 +457,7 @@ fn debug_logging_enabled_value(value: Option<&str>) -> bool {
 }
 
 fn debug_logging_enabled() -> bool {
-    debug_logging_enabled_value(env::var("DUCK_LK_DEBUG").ok().as_deref())
+    debug_logging_enabled_value(env::var(DEBUG_ENV_VAR).ok().as_deref())
 }
 
 fn debug_log(message: impl AsRef<str>) {
@@ -456,22 +489,88 @@ fn format_rows_per_second(rows: usize, elapsed: Duration) -> String {
     format!("{rows_per_second} rows/s")
 }
 
-fn fetch_page(
-    client: &LabkeyClient,
-    runtime: &Runtime,
-    schema_name: &str,
-    query_name: &str,
-    spec: PageFetchSpec,
-) -> Result<labkey_rs::query::SelectRowsResponse, Box<dyn Error>> {
-    let opts = SelectRowsOptions::builder()
-        .schema_name(schema_name.to_owned())
-        .query_name(query_name.to_owned())
-        .include_metadata(spec.include_metadata)
-        .include_total_count(spec.include_total_count)
-        .max_rows(spec.max_rows)
-        .offset(spec.offset)
-        .build();
-    Ok(runtime.block_on(client.select_rows(opts))?)
+impl<'a> FetchSession<'a> {
+    fn new(
+        schema_name: &'a str,
+        query_name: &'a str,
+        client: &'a LabkeyClient,
+        runtime: &'a Runtime,
+    ) -> Self {
+        Self {
+            schema_name,
+            query_name,
+            client,
+            runtime,
+        }
+    }
+
+    fn schema_name(&self) -> &str {
+        self.schema_name
+    }
+
+    fn query_name(&self) -> &str {
+        self.query_name
+    }
+
+    fn fetch_page(
+        &self,
+        spec: PageFetchSpec,
+    ) -> Result<labkey_rs::query::SelectRowsResponse, Box<dyn Error>> {
+        let opts = SelectRowsOptions::builder()
+            .schema_name(self.schema_name().to_owned())
+            .query_name(self.query_name().to_owned())
+            .include_metadata(spec.include_metadata)
+            .include_total_count(spec.include_total_count)
+            .max_rows(spec.max_rows)
+            .offset(spec.offset)
+            .build();
+        Ok(self.runtime.block_on(self.client.select_rows(opts))?)
+    }
+}
+
+impl FetchProgress {
+    fn new(
+        total_rows: Option<usize>,
+        first_response_rows: usize,
+        first_batch_rows: usize,
+        started: Instant,
+    ) -> Self {
+        Self {
+            written_rows: first_batch_rows,
+            total_rows,
+            total_pages: total_rows.map(|total| total.div_ceil(FETCH_PAGE_SIZE_ROWS as usize)),
+            page: 1,
+            next_offset: i64::try_from(first_response_rows).unwrap_or(i64::MAX),
+            started,
+        }
+    }
+
+    fn should_continue(&self) -> bool {
+        self.total_rows
+            .is_none_or(|total| self.written_rows < total)
+    }
+
+    fn message(&self, schema_name: &str, query_name: &str) -> String {
+        fetch_progress_message(
+            schema_name,
+            query_name,
+            self.written_rows,
+            self.total_rows,
+            self.page,
+            self.total_pages,
+            self.started.elapsed(),
+        )
+    }
+
+    fn record_page(&mut self, response_rows: usize, batch_rows: usize) {
+        self.page += 1;
+        self.written_rows += batch_rows;
+        self.next_offset += i64::try_from(response_rows).unwrap_or(i64::MAX);
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
 }
 
 fn fetch_progress_message(
@@ -500,29 +599,107 @@ fn fetch_progress_message(
     }
 }
 
-fn fetch_pages_to_parquet(
+fn debug_fetch_start(session: &FetchSession, progress: &FetchProgress) {
+    debug_log(format!(
+        "fetch start schema={} query={} page_size={} total_rows={:?}",
+        session.schema_name(),
+        session.query_name(),
+        FETCH_PAGE_SIZE_ROWS,
+        progress.total_rows
+    ));
+}
+
+fn debug_page_fetched(page: usize, offset: i64, rows: usize, total_rows: Option<usize>) {
+    debug_log(format!(
+        "page fetched page={page} offset={offset} rows={rows} total_rows={total_rows:?}"
+    ));
+}
+
+fn debug_page_converted(page: usize, rows: usize) {
+    debug_log(format!("page converted page={page} rows={rows}"));
+}
+
+fn debug_page_written(page: usize, rows: usize) {
+    debug_log(format!("page written page={page} rows={rows}"));
+}
+
+fn build_fetch_spinner(schema_name: &str, query_name: &str) -> ProgressBar {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    spinner.set_message(format!(
+        "Fetching {schema_name}.{query_name} from LabKey..."
+    ));
+    spinner.enable_steady_tick(Duration::from_millis(FETCH_PROGRESS_TICK_MS));
+    spinner
+}
+
+fn resolve_cache_write_target(
+    mgr: &cache::CacheManager,
+    config: &credential::ResolvedConfig,
     schema_name: &str,
     query_name: &str,
-    client: &LabkeyClient,
-    runtime: &Runtime,
-    pq_path: &Path,
-    spinner: &ProgressBar,
-) -> Result<PaginatedFetchResult, Box<dyn Error>> {
-    const PAGE_SIZE: i32 = 50_000;
-
-    let started = Instant::now();
-    let first_response = fetch_page(
-        client,
-        runtime,
+) -> Result<CacheWriteTarget, Box<dyn Error>> {
+    let key = cache::cache_key(
+        &config.base_url,
+        &config.container_path,
         schema_name,
         query_name,
-        PageFetchSpec {
-            offset: 0,
-            max_rows: PAGE_SIZE,
-            include_metadata: true,
-            include_total_count: true,
-        },
     )?;
+    let relative_path = cache::parquet_relative_path(
+        &config.base_url,
+        &config.container_path,
+        schema_name,
+        query_name,
+    )?;
+    let absolute_path = mgr.parquet_path_from_relative(&relative_path);
+    Ok(CacheWriteTarget {
+        key,
+        relative_path,
+        absolute_path,
+    })
+}
+
+fn persist_cache_entry(
+    mgr: &cache::CacheManager,
+    target: CacheWriteTarget,
+    config: &credential::ResolvedConfig,
+    schema_name: &str,
+    query_name: &str,
+    fetch_result: PaginatedFetchResult,
+    server_modified: Option<String>,
+) -> Result<PathBuf, Box<dyn Error>> {
+    let row_count = i64::try_from(fetch_result.row_count).unwrap_or(i64::MAX);
+    let entry = cache::CacheEntry {
+        parquet_path: target.relative_path,
+        fetched_at: chrono::Utc::now().to_rfc3339(),
+        server_modified,
+        row_count,
+        size_bytes: fetch_result.size_bytes,
+        base_url: config.base_url.clone(),
+        container_path: config.container_path.clone(),
+        schema_name: schema_name.to_owned(),
+        query_name: query_name.to_owned(),
+        columns: fetch_result.columns,
+    };
+    mgr.put_entry(&target.key, &entry)?;
+    Ok(target.absolute_path)
+}
+
+fn bootstrap_fetch(
+    session: &FetchSession,
+    pq_path: &Path,
+) -> Result<FetchBootstrap, Box<dyn Error>> {
+    let started = Instant::now();
+    let first_response = session.fetch_page(PageFetchSpec {
+        offset: 0,
+        max_rows: FETCH_PAGE_SIZE_ROWS,
+        include_metadata: true,
+        include_total_count: true,
+    })?;
+    let total_rows = usize::try_from(first_response.row_count).ok();
 
     let meta_data = first_response
         .meta_data
@@ -540,81 +717,81 @@ fn fetch_pages_to_parquet(
     let mut writer = cache::IncrementalParquetWriter::try_new(pq_path, first_batch.schema())?;
     writer.write(&first_batch)?;
 
-    let total_rows = usize::try_from(first_response.row_count).ok();
-    let total_pages = total_rows.map(|total| total.div_ceil(PAGE_SIZE as usize));
-    let mut written_rows = first_batch.num_rows();
-    let mut offset = i64::try_from(first_response.rows.len()).unwrap_or(i64::MAX);
-    let mut page = 1usize;
-
-    debug_log(format!(
-        "fetch start schema={schema_name} query={query_name} page_size={PAGE_SIZE} total_rows={total_rows:?}"
-    ));
-    debug_log(format!(
-        "page fetched page=1 rows={} total_rows={:?}",
+    let progress = FetchProgress::new(
+        total_rows,
         first_response.rows.len(),
-        total_rows
-    ));
-    debug_log(format!(
-        "page converted+wrote page=1 rows={}",
-        first_batch.num_rows()
-    ));
+        first_batch.num_rows(),
+        started,
+    );
+    debug_fetch_start(session, &progress);
+    debug_page_fetched(1, 0, first_response.rows.len(), progress.total_rows);
+    debug_page_converted(1, first_batch.num_rows());
+    debug_page_written(1, first_batch.num_rows());
 
-    while !first_response.rows.is_empty() && total_rows.is_none_or(|total| written_rows < total) {
-        spinner.set_message(fetch_progress_message(
-            schema_name,
-            query_name,
-            written_rows,
-            total_rows,
-            page,
-            total_pages,
-            started.elapsed(),
-        ));
+    Ok(FetchBootstrap {
+        filtered_columns,
+        columns,
+        writer,
+        progress,
+    })
+}
 
-        let page_response = fetch_page(
-            client,
-            runtime,
-            schema_name,
-            query_name,
-            PageFetchSpec {
-                offset,
-                max_rows: PAGE_SIZE,
-                include_metadata: false,
-                include_total_count: false,
-            },
-        )?;
-        page += 1;
-        debug_log(format!(
-            "page fetched page={} offset={} rows={}",
-            page,
-            offset,
-            page_response.rows.len()
-        ));
+fn fetch_next_page(
+    session: &FetchSession,
+    filtered_columns: &[QueryColumn],
+    writer: &mut cache::IncrementalParquetWriter,
+    progress: &mut FetchProgress,
+) -> Result<bool, Box<dyn Error>> {
+    let page_response = session.fetch_page(PageFetchSpec {
+        offset: progress.next_offset,
+        max_rows: FETCH_PAGE_SIZE_ROWS,
+        include_metadata: false,
+        include_total_count: false,
+    })?;
+    let page = progress.page + 1;
+    debug_page_fetched(
+        page,
+        progress.next_offset,
+        page_response.rows.len(),
+        progress.total_rows,
+    );
 
-        if page_response.rows.is_empty() {
+    if page_response.rows.is_empty() {
+        return Ok(false);
+    }
+
+    let page_batch = types::rows_to_record_batch(&page_response.rows, filtered_columns)?;
+    debug_page_converted(page, page_batch.num_rows());
+    writer.write(&page_batch)?;
+    debug_page_written(page, page_batch.num_rows());
+    progress.record_page(page_response.rows.len(), page_batch.num_rows());
+    Ok(true)
+}
+
+fn fetch_pages_to_parquet(
+    session: &FetchSession,
+    pq_path: &Path,
+    spinner: &ProgressBar,
+) -> Result<PaginatedFetchResult, Box<dyn Error>> {
+    let FetchBootstrap {
+        filtered_columns,
+        columns,
+        mut writer,
+        mut progress,
+    } = bootstrap_fetch(session, pq_path)?;
+
+    while progress.should_continue() {
+        spinner.set_message(progress.message(session.schema_name(), session.query_name()));
+        if !fetch_next_page(session, &filtered_columns, &mut writer, &mut progress)? {
             break;
         }
-
-        let page_batch = types::rows_to_record_batch(&page_response.rows, &filtered_columns)?;
-        debug_log(format!(
-            "page converted page={} rows={}",
-            page,
-            page_batch.num_rows()
-        ));
-        writer.write(&page_batch)?;
-        debug_log(format!(
-            "page written page={} rows={}",
-            page,
-            page_batch.num_rows()
-        ));
-        written_rows += page_batch.num_rows();
-        offset += i64::try_from(page_response.rows.len()).unwrap_or(i64::MAX);
     }
 
     Ok(PaginatedFetchResult {
         columns,
-        row_count: written_rows,
+        row_count: progress.written_rows,
         size_bytes: writer.finish()?,
-        elapsed: started.elapsed(),
+        elapsed: progress.elapsed(),
     })
 }
 
@@ -650,33 +827,12 @@ pub(crate) fn sync_to_cache(
         config.container_path.clone(),
     );
     let client = LabkeyClient::new(client_config)?;
-
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    spinner.set_message(format!(
-        "Fetching {schema_name}.{query_name} from LabKey..."
-    ));
-    spinner.enable_steady_tick(Duration::from_millis(100));
+    let spinner = build_fetch_spinner(schema_name, query_name);
 
     let mgr = cache::CacheManager::new()?;
-    let key = cache::cache_key(
-        &config.base_url,
-        &config.container_path,
-        schema_name,
-        query_name,
-    )?;
-    let relative_path = cache::parquet_relative_path(
-        &config.base_url,
-        &config.container_path,
-        schema_name,
-        query_name,
-    )?;
-    let pq_path = mgr.parquet_path_from_relative(&relative_path);
-    let fetch_result =
-        fetch_pages_to_parquet(schema_name, query_name, &client, &rt, &pq_path, &spinner)?;
+    let target = resolve_cache_write_target(&mgr, config, schema_name, query_name)?;
+    let session = FetchSession::new(schema_name, query_name, &client, &rt);
+    let fetch_result = fetch_pages_to_parquet(&session, &target.absolute_path, &spinner)?;
 
     spinner.finish_with_message(format!(
         "Fetched {} rows from {schema_name}.{query_name} ({:.1}s)",
@@ -686,28 +842,16 @@ pub(crate) fn sync_to_cache(
 
     let server_modified =
         cache::CacheManager::check_staleness(&client, &rt, schema_name, query_name);
-    let row_count = i64::try_from(fetch_result.row_count).unwrap_or(i64::MAX);
 
-    let entry_without_size = cache::CacheEntry {
-        parquet_path: relative_path,
-        fetched_at: chrono::Utc::now().to_rfc3339(),
+    persist_cache_entry(
+        &mgr,
+        target,
+        config,
+        schema_name,
+        query_name,
+        fetch_result,
         server_modified,
-        row_count,
-        size_bytes: 0,
-        base_url: config.base_url.clone(),
-        container_path: config.container_path.clone(),
-        schema_name: schema_name.to_owned(),
-        query_name: query_name.to_owned(),
-        columns: fetch_result.columns,
-    };
-
-    let entry = cache::CacheEntry {
-        size_bytes: fetch_result.size_bytes,
-        ..entry_without_size
-    };
-    mgr.put_entry(&key, &entry)?;
-
-    Ok(pq_path)
+    )
 }
 
 fn fetch_and_cache(bind_data: &LabkeyBindData) -> Result<std::path::PathBuf, Box<dyn Error>> {
