@@ -11,7 +11,9 @@
 //! - `func()`: writes `RecordBatch` data to `DuckDB` vectors in chunks.
 
 use std::{
+    env,
     error::Error,
+    path::{Path, PathBuf},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -30,6 +32,7 @@ use labkey_rs::{
     ClientConfig, LabkeyClient,
 };
 use libduckdb_sys::{duckdb_date, duckdb_timestamp};
+use tokio::runtime::Runtime;
 
 use super::{cache, credential, types};
 
@@ -56,7 +59,7 @@ pub(crate) struct LabkeyBindData {
     offline: bool,
     /// Path to the Parquet file to read (set after cache resolution).
     /// `Some` = cache hit, `None` = cache miss / stale.
-    parquet_path: Option<std::path::PathBuf>,
+    parquet_path: Option<PathBuf>,
 }
 
 /// Init data for the `labkey_query` table function.
@@ -156,7 +159,7 @@ impl VTab for LabkeyQueryVTab {
         }
 
         // 8. Fresh fetch — get metadata from LabKey
-        let rt = tokio::runtime::Runtime::new()?;
+        let rt = Runtime::new()?;
         let client_config = ClientConfig::new(
             config.base_url.clone(),
             config.credential.clone(),
@@ -383,7 +386,7 @@ fn check_freshness(
     query_name: &str,
     cached_modified: &str,
 ) -> Option<bool> {
-    let rt = tokio::runtime::Runtime::new().ok()?;
+    let rt = Runtime::new().ok()?;
     let client_config = ClientConfig::new(
         config.base_url.clone(),
         config.credential.clone(),
@@ -411,9 +414,51 @@ struct PaginatedFetchResult {
     elapsed: Duration,
 }
 
+fn debug_logging_enabled_value(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn debug_logging_enabled() -> bool {
+    debug_logging_enabled_value(env::var("DUCK_LK_DEBUG").ok().as_deref())
+}
+
+fn debug_log(message: impl AsRef<str>) {
+    if debug_logging_enabled() {
+        eprintln!("[duck-lk] {}", message.as_ref());
+    }
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    let millis = elapsed.subsec_millis();
+    if secs >= 60 {
+        let minutes = secs / 60;
+        let rem = secs % 60;
+        format!("{minutes}m{rem:02}s")
+    } else if secs > 0 {
+        format!("{secs}.{millis:03}s")
+    } else {
+        format!("0.{millis:03}s")
+    }
+}
+
+fn format_rows_per_second(rows: usize, elapsed: Duration) -> String {
+    let millis = elapsed.as_millis();
+    if millis == 0 {
+        return "- rows/s".to_string();
+    }
+    let rows_per_second = ((rows as u128) * 1_000) / millis;
+    format!("{rows_per_second} rows/s")
+}
+
 fn fetch_page(
     client: &LabkeyClient,
-    runtime: &tokio::runtime::Runtime,
+    runtime: &Runtime,
     schema_name: &str,
     query_name: &str,
     spec: PageFetchSpec,
@@ -434,14 +479,24 @@ fn fetch_progress_message(
     query_name: &str,
     written_rows: usize,
     total_rows: Option<usize>,
+    page: usize,
+    total_pages: Option<usize>,
+    elapsed: Duration,
 ) -> String {
+    let page_part = match total_pages {
+        Some(total) => format!("page {page}/{total}"),
+        None => format!("page {page}"),
+    };
+    let throughput = format_rows_per_second(written_rows, elapsed);
+    let elapsed = format_elapsed(elapsed);
+
     match total_rows {
-        Some(total) => {
-            format!(
-                "Fetching {schema_name}.{query_name} from LabKey... {written_rows}/{total} rows"
-            )
-        }
-        None => format!("Fetching {schema_name}.{query_name} from LabKey... {written_rows} rows"),
+        Some(total) => format!(
+            "Fetching {schema_name}.{query_name} from LabKey... {written_rows}/{total} rows ({page_part}, {throughput}, {elapsed})"
+        ),
+        None => format!(
+            "Fetching {schema_name}.{query_name} from LabKey... {written_rows} rows ({page_part}, {throughput}, {elapsed})"
+        ),
     }
 }
 
@@ -449,11 +504,11 @@ fn fetch_pages_to_parquet(
     schema_name: &str,
     query_name: &str,
     client: &LabkeyClient,
-    runtime: &tokio::runtime::Runtime,
-    pq_path: &std::path::Path,
+    runtime: &Runtime,
+    pq_path: &Path,
     spinner: &ProgressBar,
 ) -> Result<PaginatedFetchResult, Box<dyn Error>> {
-    const PAGE_SIZE: i32 = 10_000;
+    const PAGE_SIZE: i32 = 50_000;
 
     let started = Instant::now();
     let first_response = fetch_page(
@@ -486,8 +541,23 @@ fn fetch_pages_to_parquet(
     writer.write(&first_batch)?;
 
     let total_rows = usize::try_from(first_response.row_count).ok();
+    let total_pages = total_rows.map(|total| total.div_ceil(PAGE_SIZE as usize));
     let mut written_rows = first_batch.num_rows();
     let mut offset = i64::try_from(first_response.rows.len()).unwrap_or(i64::MAX);
+    let mut page = 1usize;
+
+    debug_log(format!(
+        "fetch start schema={schema_name} query={query_name} page_size={PAGE_SIZE} total_rows={total_rows:?}"
+    ));
+    debug_log(format!(
+        "page fetched page=1 rows={} total_rows={:?}",
+        first_response.rows.len(),
+        total_rows
+    ));
+    debug_log(format!(
+        "page converted+wrote page=1 rows={}",
+        first_batch.num_rows()
+    ));
 
     while !first_response.rows.is_empty() && total_rows.is_none_or(|total| written_rows < total) {
         spinner.set_message(fetch_progress_message(
@@ -495,6 +565,9 @@ fn fetch_pages_to_parquet(
             query_name,
             written_rows,
             total_rows,
+            page,
+            total_pages,
+            started.elapsed(),
         ));
 
         let page_response = fetch_page(
@@ -509,13 +582,30 @@ fn fetch_pages_to_parquet(
                 include_total_count: false,
             },
         )?;
+        page += 1;
+        debug_log(format!(
+            "page fetched page={} offset={} rows={}",
+            page,
+            offset,
+            page_response.rows.len()
+        ));
 
         if page_response.rows.is_empty() {
             break;
         }
 
         let page_batch = types::rows_to_record_batch(&page_response.rows, &filtered_columns)?;
+        debug_log(format!(
+            "page converted page={} rows={}",
+            page,
+            page_batch.num_rows()
+        ));
         writer.write(&page_batch)?;
+        debug_log(format!(
+            "page written page={} rows={}",
+            page,
+            page_batch.num_rows()
+        ));
         written_rows += page_batch.num_rows();
         offset += i64::try_from(page_response.rows.len()).unwrap_or(i64::MAX);
     }
@@ -553,7 +643,7 @@ pub(crate) fn sync_to_cache(
     schema_name: &str,
     query_name: &str,
 ) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    let rt = tokio::runtime::Runtime::new()?;
+    let rt = Runtime::new()?;
     let client_config = ClientConfig::new(
         config.base_url.clone(),
         config.credential.clone(),
@@ -1060,13 +1150,63 @@ mod tests {
 
     #[test]
     fn fetch_progress_message_with_total_rows() {
-        let msg = fetch_progress_message("lists", "People", 500, Some(1_000));
-        assert_eq!(msg, "Fetching lists.People from LabKey... 500/1000 rows");
+        let msg = fetch_progress_message(
+            "lists",
+            "People",
+            500,
+            Some(1_000),
+            5,
+            Some(10),
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            msg,
+            "Fetching lists.People from LabKey... 500/1000 rows (page 5/10, 250 rows/s, 2.000s)"
+        );
     }
 
     #[test]
     fn fetch_progress_message_without_total_rows() {
-        let msg = fetch_progress_message("lists", "People", 500, None);
-        assert_eq!(msg, "Fetching lists.People from LabKey... 500 rows");
+        let msg = fetch_progress_message(
+            "lists",
+            "People",
+            500,
+            None,
+            5,
+            None,
+            Duration::from_millis(500),
+        );
+        assert_eq!(
+            msg,
+            "Fetching lists.People from LabKey... 500 rows (page 5, 1000 rows/s, 0.500s)"
+        );
+    }
+
+    #[test]
+    fn debug_logging_enabled_value_truthy_values() {
+        for value in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(
+                debug_logging_enabled_value(Some(value)),
+                "{value} should enable debug logging"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_logging_enabled_value_falsey_values() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+            Some("anything-else"),
+        ] {
+            assert!(
+                !debug_logging_enabled_value(value),
+                "{value:?} should disable debug logging"
+            );
+        }
     }
 }
