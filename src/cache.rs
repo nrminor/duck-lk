@@ -329,11 +329,18 @@ impl CacheManager {
         self.cache_dir.join(&entry.parquet_path)
     }
 
+    /// Returns the absolute path for a Parquet file given a relative cache
+    /// path stored in `cache.json`.
+    pub(crate) fn parquet_path_from_relative(&self, relative_path: &str) -> PathBuf {
+        self.cache_dir.join(relative_path)
+    }
+
     /// Writes a `RecordBatch` to a Parquet file at `path`. Uses atomic
     /// temp-file + rename. Returns the file size in bytes.
     ///
     /// The caller is responsible for constructing the full path (e.g. via
     /// [`parquet_path`](Self::parquet_path)).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn write_parquet(path: &Path, batch: &RecordBatch) -> Result<u64, Box<dyn Error>> {
         let mut writer = IncrementalParquetWriter::try_new(path, batch.schema())?;
         writer.write(batch)?;

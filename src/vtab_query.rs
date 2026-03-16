@@ -378,6 +378,137 @@ fn check_freshness(
     Some(server_modified == cached_modified)
 }
 
+struct PageFetchSpec {
+    offset: i64,
+    max_rows: i32,
+    include_metadata: bool,
+    include_total_count: bool,
+}
+
+struct PaginatedFetchResult {
+    columns: Vec<cache::CacheColumn>,
+    row_count: usize,
+    size_bytes: u64,
+    elapsed: Duration,
+}
+
+fn fetch_page(
+    client: &LabkeyClient,
+    runtime: &tokio::runtime::Runtime,
+    schema_name: &str,
+    query_name: &str,
+    spec: PageFetchSpec,
+) -> Result<labkey_rs::query::SelectRowsResponse, Box<dyn Error>> {
+    let opts = SelectRowsOptions::builder()
+        .schema_name(schema_name.to_owned())
+        .query_name(query_name.to_owned())
+        .include_metadata(spec.include_metadata)
+        .include_total_count(spec.include_total_count)
+        .max_rows(spec.max_rows)
+        .offset(spec.offset)
+        .build();
+    Ok(runtime.block_on(client.select_rows(opts))?)
+}
+
+fn fetch_progress_message(
+    schema_name: &str,
+    query_name: &str,
+    written_rows: usize,
+    total_rows: Option<usize>,
+) -> String {
+    match total_rows {
+        Some(total) => {
+            format!(
+                "Fetching {schema_name}.{query_name} from LabKey... {written_rows}/{total} rows"
+            )
+        }
+        None => format!("Fetching {schema_name}.{query_name} from LabKey... {written_rows} rows"),
+    }
+}
+
+fn fetch_pages_to_parquet(
+    schema_name: &str,
+    query_name: &str,
+    client: &LabkeyClient,
+    runtime: &tokio::runtime::Runtime,
+    pq_path: &std::path::Path,
+    spinner: &ProgressBar,
+) -> Result<PaginatedFetchResult, Box<dyn Error>> {
+    const PAGE_SIZE: i32 = 10_000;
+
+    let started = Instant::now();
+    let first_response = fetch_page(
+        client,
+        runtime,
+        schema_name,
+        query_name,
+        PageFetchSpec {
+            offset: 0,
+            max_rows: PAGE_SIZE,
+            include_metadata: true,
+            include_total_count: true,
+        },
+    )?;
+
+    let meta_data = first_response
+        .meta_data
+        .ok_or("LabKey did not return column metadata on paginated data fetch.")?;
+    let filtered_columns = filter_columns(meta_data.fields);
+    let columns: Vec<cache::CacheColumn> = filtered_columns
+        .iter()
+        .map(|c| cache::CacheColumn {
+            name: c.name.clone(),
+            json_type: c.json_type.clone(),
+        })
+        .collect();
+
+    let first_batch = types::rows_to_record_batch(&first_response.rows, &filtered_columns)?;
+    let mut writer = cache::IncrementalParquetWriter::try_new(pq_path, first_batch.schema())?;
+    writer.write(&first_batch)?;
+
+    let total_rows = usize::try_from(first_response.row_count).ok();
+    let mut written_rows = first_batch.num_rows();
+    let mut offset = i64::try_from(first_response.rows.len()).unwrap_or(i64::MAX);
+
+    while !first_response.rows.is_empty() && total_rows.is_none_or(|total| written_rows < total) {
+        spinner.set_message(fetch_progress_message(
+            schema_name,
+            query_name,
+            written_rows,
+            total_rows,
+        ));
+
+        let page_response = fetch_page(
+            client,
+            runtime,
+            schema_name,
+            query_name,
+            PageFetchSpec {
+                offset,
+                max_rows: PAGE_SIZE,
+                include_metadata: false,
+                include_total_count: false,
+            },
+        )?;
+
+        if page_response.rows.is_empty() {
+            break;
+        }
+
+        let page_batch = types::rows_to_record_batch(&page_response.rows, &filtered_columns)?;
+        writer.write(&page_batch)?;
+        written_rows += page_batch.num_rows();
+        offset += i64::try_from(page_response.rows.len()).unwrap_or(i64::MAX);
+    }
+
+    Ok(PaginatedFetchResult {
+        columns,
+        row_count: written_rows,
+        size_bytes: writer.finish()?,
+        elapsed: started.elapsed(),
+    })
+}
+
 /// Fetches all rows from `LabKey`, writes them to the Parquet cache, and
 /// returns the resulting `RecordBatch`.
 #[allow(clippy::doc_markdown)]
@@ -397,13 +528,6 @@ pub(crate) fn sync_to_cache(
     );
     let client = LabkeyClient::new(client_config)?;
 
-    let data_opts = SelectRowsOptions::builder()
-        .schema_name(schema_name.to_owned())
-        .query_name(query_name.to_owned())
-        .include_metadata(true)
-        .show_rows(ShowRows::All)
-        .build();
-
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -414,23 +538,6 @@ pub(crate) fn sync_to_cache(
     ));
     spinner.enable_steady_tick(Duration::from_millis(100));
 
-    let started = Instant::now();
-    let data_response = rt.block_on(client.select_rows(data_opts))?;
-    let elapsed = started.elapsed();
-
-    let meta_data = data_response
-        .meta_data
-        .ok_or("LabKey did not return column metadata on data fetch.")?;
-    let filtered_columns = filter_columns(meta_data.fields);
-
-    let batch = types::rows_to_record_batch(&data_response.rows, &filtered_columns)?;
-
-    spinner.finish_with_message(format!(
-        "Fetched {} rows from {schema_name}.{query_name} ({:.1}s)",
-        batch.num_rows(),
-        elapsed.as_secs_f64(),
-    ));
-
     let mgr = cache::CacheManager::new()?;
     let key = cache::cache_key(
         &config.base_url,
@@ -438,24 +545,25 @@ pub(crate) fn sync_to_cache(
         schema_name,
         query_name,
     )?;
-
     let relative_path = cache::parquet_relative_path(
         &config.base_url,
         &config.container_path,
         schema_name,
         query_name,
     )?;
+    let pq_path = mgr.parquet_path_from_relative(&relative_path);
+    let fetch_result =
+        fetch_pages_to_parquet(schema_name, query_name, &client, &rt, &pq_path, &spinner)?;
+
+    spinner.finish_with_message(format!(
+        "Fetched {} rows from {schema_name}.{query_name} ({:.1}s)",
+        fetch_result.row_count,
+        fetch_result.elapsed.as_secs_f64(),
+    ));
 
     let server_modified =
         cache::CacheManager::check_staleness(&client, &rt, schema_name, query_name);
-    let row_count = i64::try_from(batch.num_rows()).unwrap_or(i64::MAX);
-    let columns: Vec<cache::CacheColumn> = filtered_columns
-        .iter()
-        .map(|c| cache::CacheColumn {
-            name: c.name.clone(),
-            json_type: c.json_type.clone(),
-        })
-        .collect();
+    let row_count = i64::try_from(fetch_result.row_count).unwrap_or(i64::MAX);
 
     let entry_without_size = cache::CacheEntry {
         parquet_path: relative_path,
@@ -467,14 +575,11 @@ pub(crate) fn sync_to_cache(
         container_path: config.container_path.clone(),
         schema_name: schema_name.to_owned(),
         query_name: query_name.to_owned(),
-        columns,
+        columns: fetch_result.columns,
     };
 
-    let pq_path = mgr.parquet_path(&entry_without_size);
-    let size = cache::CacheManager::write_parquet(&pq_path, &batch)?;
-
     let entry = cache::CacheEntry {
-        size_bytes: size,
+        size_bytes: fetch_result.size_bytes,
         ..entry_without_size
     };
     mgr.put_entry(&key, &entry)?;
@@ -919,5 +1024,17 @@ mod tests {
             bind.column_types,
             vec![LogicalTypeId::Varchar, LogicalTypeId::Varchar]
         );
+    }
+
+    #[test]
+    fn fetch_progress_message_with_total_rows() {
+        let msg = fetch_progress_message("lists", "People", 500, Some(1_000));
+        assert_eq!(msg, "Fetching lists.People from LabKey... 500/1000 rows");
+    }
+
+    #[test]
+    fn fetch_progress_message_without_total_rows() {
+        let msg = fetch_progress_message("lists", "People", 500, None);
+        assert_eq!(msg, "Fetching lists.People from LabKey... 500 rows");
     }
 }
