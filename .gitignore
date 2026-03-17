@@ -40,8 +40,9 @@
 # extension-ci-tools submodule (managed by git submodules)
 !/extension-ci-tools
 
-# agents directory (reference repos and docs, not checked in)
-.agents/
+# agents directory (only selected docs checked in)
+!/.agents
+!/.agents/bulk-export-roadmap.md
 
 # opencode config
 !opencode.json
