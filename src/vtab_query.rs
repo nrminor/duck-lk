@@ -1074,6 +1074,10 @@ fn write_varchar_column(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
     use serde_json::json;
 
     fn make_column(name: &str, json_type: Option<&str>, hidden: bool) -> QueryColumn {
@@ -1094,6 +1098,20 @@ mod tests {
             col_json["jsonType"] = json!(jt);
         }
         serde_json::from_value(col_json).expect("QueryColumn deserialization")
+    }
+
+    fn sample_record_batch(names: &[&str], ages: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+        ]));
+        let names = Arc::new(StringArray::from(
+            names.iter().map(|name| Some(*name)).collect::<Vec<_>>(),
+        ));
+        let ages = Arc::new(Int64Array::from(
+            ages.iter().map(|age| Some(*age)).collect::<Vec<_>>(),
+        ));
+        RecordBatch::try_new(schema, vec![names, ages]).expect("RecordBatch")
     }
 
     #[test]
@@ -1352,5 +1370,69 @@ mod tests {
                 "{value:?} should disable debug logging"
             );
         }
+    }
+
+    #[test]
+    fn fetch_progress_tracks_pages_offsets_and_counts() {
+        let mut progress = FetchProgress::new(Some(120_000), 50_000, 50_000, Instant::now());
+
+        assert!(progress.should_continue());
+        assert_eq!(progress.page, 1);
+        assert_eq!(progress.next_offset, 50_000);
+        assert_eq!(progress.written_rows, 50_000);
+        assert_eq!(progress.total_pages, Some(3));
+
+        progress.record_page(50_000, 50_000);
+        assert_eq!(progress.page, 2);
+        assert_eq!(progress.next_offset, 100_000);
+        assert_eq!(progress.written_rows, 100_000);
+        assert!(progress.should_continue());
+
+        progress.record_page(20_000, 20_000);
+        assert_eq!(progress.page, 3);
+        assert_eq!(progress.next_offset, 120_000);
+        assert_eq!(progress.written_rows, 120_000);
+        assert!(!progress.should_continue());
+    }
+
+    #[test]
+    fn advance_to_next_batch_resets_offset_and_exhausts_reader() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("streamed.parquet");
+        let batch1 = sample_record_batch(&["Alice", "Bob"], &[30, 31]);
+        let batch2 = sample_record_batch(&["Carol", "Dave"], &[40, 41]);
+
+        let mut writer = cache::IncrementalParquetWriter::try_new(&path, batch1.schema())
+            .expect("IncrementalParquetWriter::try_new");
+        writer.write(&batch1).expect("write batch1");
+        writer.write(&batch2).expect("write batch2");
+        writer.finish().expect("finish writer");
+
+        let mut reader = cache::CacheManager::open_parquet_batch_reader(&path, 2)
+            .expect("open_parquet_batch_reader");
+        let first = reader
+            .next()
+            .expect("first batch exists")
+            .expect("first batch ok");
+        let mut state = ParquetStreamState {
+            reader,
+            current_batch: Some(first),
+            row_offset: 2,
+        };
+
+        assert!(advance_to_next_batch(&mut state).expect("advance to second batch"));
+        assert_eq!(state.row_offset, 0);
+        assert_eq!(
+            state
+                .current_batch
+                .as_ref()
+                .expect("current batch")
+                .num_rows(),
+            2
+        );
+
+        assert!(!advance_to_next_batch(&mut state).expect("reader exhausted"));
+        assert_eq!(state.row_offset, 0);
+        assert!(state.current_batch.is_none());
     }
 }
