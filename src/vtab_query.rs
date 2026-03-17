@@ -380,18 +380,26 @@ fn check_freshness(
 
 /// Fetches all rows from `LabKey`, writes them to the Parquet cache, and
 /// returns the resulting `RecordBatch`.
-fn fetch_and_cache(bind_data: &LabkeyBindData) -> Result<arrow_array::RecordBatch, Box<dyn Error>> {
+#[allow(clippy::doc_markdown)]
+/// Syncs a LabKey table to the local Parquet cache and returns the path to
+/// the cached file. This is the shared implementation used by both
+/// `labkey_query` (VTab) and `labkey_sync` (CALL-only).
+pub(crate) fn sync_to_cache(
+    config: &credential::ResolvedConfig,
+    schema_name: &str,
+    query_name: &str,
+) -> Result<std::path::PathBuf, Box<dyn Error>> {
     let rt = tokio::runtime::Runtime::new()?;
     let client_config = ClientConfig::new(
-        bind_data.config.base_url.clone(),
-        bind_data.config.credential.clone(),
-        bind_data.config.container_path.clone(),
+        config.base_url.clone(),
+        config.credential.clone(),
+        config.container_path.clone(),
     );
     let client = LabkeyClient::new(client_config)?;
 
     let data_opts = SelectRowsOptions::builder()
-        .schema_name(bind_data.schema_name.clone())
-        .query_name(bind_data.query_name.clone())
+        .schema_name(schema_name.to_owned())
+        .query_name(query_name.to_owned())
         .include_metadata(true)
         .show_rows(ShowRows::All)
         .build();
@@ -402,8 +410,7 @@ fn fetch_and_cache(bind_data: &LabkeyBindData) -> Result<arrow_array::RecordBatc
             .unwrap_or_else(|_| ProgressStyle::default_spinner()),
     );
     spinner.set_message(format!(
-        "Fetching {}.{} from LabKey...",
-        bind_data.schema_name, bind_data.query_name
+        "Fetching {schema_name}.{query_name} from LabKey..."
     ));
     spinner.enable_steady_tick(Duration::from_millis(100));
 
@@ -419,34 +426,28 @@ fn fetch_and_cache(bind_data: &LabkeyBindData) -> Result<arrow_array::RecordBatc
     let batch = types::rows_to_record_batch(&data_response.rows, &filtered_columns)?;
 
     spinner.finish_with_message(format!(
-        "Fetched {} rows from {}.{} ({:.1}s)",
+        "Fetched {} rows from {schema_name}.{query_name} ({:.1}s)",
         batch.num_rows(),
-        bind_data.schema_name,
-        bind_data.query_name,
         elapsed.as_secs_f64(),
     ));
 
     let mgr = cache::CacheManager::new()?;
     let key = cache::cache_key(
-        &bind_data.config.base_url,
-        &bind_data.config.container_path,
-        &bind_data.schema_name,
-        &bind_data.query_name,
+        &config.base_url,
+        &config.container_path,
+        schema_name,
+        query_name,
     )?;
 
     let relative_path = cache::parquet_relative_path(
-        &bind_data.config.base_url,
-        &bind_data.config.container_path,
-        &bind_data.schema_name,
-        &bind_data.query_name,
+        &config.base_url,
+        &config.container_path,
+        schema_name,
+        query_name,
     )?;
 
-    let server_modified = cache::CacheManager::check_staleness(
-        &client,
-        &rt,
-        &bind_data.schema_name,
-        &bind_data.query_name,
-    );
+    let server_modified =
+        cache::CacheManager::check_staleness(&client, &rt, schema_name, query_name);
     let row_count = i64::try_from(batch.num_rows()).unwrap_or(i64::MAX);
     let columns: Vec<cache::CacheColumn> = filtered_columns
         .iter()
@@ -456,17 +457,16 @@ fn fetch_and_cache(bind_data: &LabkeyBindData) -> Result<arrow_array::RecordBatc
         })
         .collect();
 
-    let pq_path_str = relative_path;
     let entry_without_size = cache::CacheEntry {
-        parquet_path: pq_path_str,
+        parquet_path: relative_path,
         fetched_at: chrono::Utc::now().to_rfc3339(),
         server_modified,
         row_count,
         size_bytes: 0,
-        base_url: bind_data.config.base_url.clone(),
-        container_path: bind_data.config.container_path.clone(),
-        schema_name: bind_data.schema_name.clone(),
-        query_name: bind_data.query_name.clone(),
+        base_url: config.base_url.clone(),
+        container_path: config.container_path.clone(),
+        schema_name: schema_name.to_owned(),
+        query_name: query_name.to_owned(),
         columns,
     };
 
@@ -479,7 +479,16 @@ fn fetch_and_cache(bind_data: &LabkeyBindData) -> Result<arrow_array::RecordBatc
     };
     mgr.put_entry(&key, &entry)?;
 
-    Ok(batch)
+    Ok(pq_path)
+}
+
+fn fetch_and_cache(bind_data: &LabkeyBindData) -> Result<arrow_array::RecordBatch, Box<dyn Error>> {
+    let pq_path = sync_to_cache(
+        &bind_data.config,
+        &bind_data.schema_name,
+        &bind_data.query_name,
+    )?;
+    cache::CacheManager::read_parquet(&pq_path)
 }
 
 /// Writes an `Int64` Arrow column to a `DuckDB` `FlatVector`.

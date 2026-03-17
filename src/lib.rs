@@ -42,6 +42,14 @@ mod vtab_cache_clear;
 #[allow(clippy::doc_markdown)]
 mod replacement_scan;
 
+#[path = "vtab_sync.rs"]
+#[allow(clippy::doc_markdown)]
+mod vtab_sync;
+
+#[path = "scalar_helpers.rs"]
+#[allow(clippy::doc_markdown)]
+mod scalar_helpers;
+
 use duckdb::Connection;
 use std::error::Error;
 
@@ -55,8 +63,11 @@ fn register_extension(
     db: libduckdb_sys::duckdb_database,
 ) -> Result<(), Box<dyn Error>> {
     con.register_table_function::<vtab_query::LabkeyQueryVTab>("labkey_query")?;
+    con.register_table_function::<vtab_sync::LabkeySyncVTab>("labkey_sync")?;
     con.register_table_function::<vtab_cache_clear::LabkeyCacheClearVTab>("labkey_cache_clear")?;
     con.register_table_function::<vtab_cache_info::LabkeyCacheInfoVTab>("labkey_cache_info")?;
+    con.register_scalar_function::<scalar_helpers::LabkeyParquetPath>("labkey_parquet_path")?;
+    con.register_scalar_function::<scalar_helpers::LabkeyIsStale>("labkey_is_stale")?;
 
     // Safety: db is a valid database handle obtained from the extension access
     // struct during initialization. The replacement scan callback uses only
