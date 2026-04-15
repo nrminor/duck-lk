@@ -2,7 +2,8 @@
 //!
 //! Resolves connection parameters from a precedence chain:
 //! 1. Named SQL parameters (`base_url`, `container_path`, `api_key`)
-//! 2. Environment variables (`LABKEY_BASE_URL`, `LABKEY_CONTAINER_PATH`, `LABKEY_API_KEY`)
+//! 2. Environment variables (`LABKEY_BASE_URL`, `LABKEY_CONTAINER`, `LABKEY_API_KEY`)
+//!    with `LABKEY_CONTAINER_PATH` accepted as a legacy fallback
 //! 3. `.netrc` file (looked up by hostname extracted from the resolved base URL)
 //! 4. Guest (no credentials)
 
@@ -55,6 +56,7 @@ pub(crate) fn resolve_config(
 
     // --- container_path: param → env → "/" ---
     let container_path = param_container_path
+        .or_else(|| env::var("LABKEY_CONTAINER").ok())
         .or_else(|| env::var("LABKEY_CONTAINER_PATH").ok())
         .unwrap_or_else(|| "/".to_owned());
 
@@ -104,11 +106,31 @@ mod tests {
     /// Helper: run a closure with specific env vars set, restoring originals
     /// afterward regardless of panics.
     fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
+        const MANAGED_VARS: [&str; 4] = [
+            "LABKEY_BASE_URL",
+            "LABKEY_API_KEY",
+            "LABKEY_CONTAINER",
+            "LABKEY_CONTAINER_PATH",
+        ];
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let originals: Vec<(&str, Option<String>)> =
-            vars.iter().map(|(k, _)| (*k, env::var(k).ok())).collect();
+
+        let mut managed_keys: Vec<&str> = vars.iter().map(|(k, _)| *k).collect();
+        for key in MANAGED_VARS {
+            if !managed_keys.contains(&key) {
+                managed_keys.push(key);
+            }
+        }
+
+        let originals: Vec<(&str, Option<String>)> = managed_keys
+            .iter()
+            .map(|k| (*k, env::var(k).ok()))
+            .collect();
+
+        for key in &managed_keys {
+            env::remove_var(key);
+        }
 
         for (k, v) in vars {
             match v {
@@ -210,7 +232,7 @@ mod tests {
             &[
                 ("LABKEY_BASE_URL", None),
                 ("LABKEY_API_KEY", None),
-                ("LABKEY_CONTAINER_PATH", Some("/EnvProject")),
+                ("LABKEY_CONTAINER", Some("/EnvProject")),
             ],
             || {
                 let cfg = resolve_config(
@@ -220,6 +242,27 @@ mod tests {
                 )
                 .expect("should succeed");
                 assert_eq!(cfg.container_path, "/EnvProject");
+            },
+        );
+    }
+
+    #[test]
+    fn container_path_prefers_labkey_container_over_legacy_name() {
+        with_env(
+            &[
+                ("LABKEY_BASE_URL", None),
+                ("LABKEY_API_KEY", None),
+                ("LABKEY_CONTAINER", Some("/PreferredProject")),
+                ("LABKEY_CONTAINER_PATH", Some("/LegacyProject")),
+            ],
+            || {
+                let cfg = resolve_config(
+                    Some("https://lk.example.com".into()),
+                    None,
+                    Some("key".into()),
+                )
+                .expect("should succeed");
+                assert_eq!(cfg.container_path, "/PreferredProject");
             },
         );
     }

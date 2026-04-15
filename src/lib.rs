@@ -50,6 +50,15 @@ mod vtab_sync;
 #[allow(clippy::doc_markdown)]
 mod scalar_helpers;
 
+#[path = "experimental_sql.rs"]
+#[allow(
+    dead_code,
+    clippy::doc_markdown,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+mod experimental_sql;
+
 use duckdb::Connection;
 use std::error::Error;
 
@@ -96,8 +105,7 @@ unsafe fn duck_lk_init_c_api_internal(
     access: *const libduckdb_sys::duckdb_extension_access,
 ) -> Result<bool, Box<dyn Error>> {
     let have_api_struct =
-        libduckdb_sys::duckdb_rs_extension_api_init(info, access, MINIMUM_DUCKDB_VERSION)
-            .unwrap();
+        libduckdb_sys::duckdb_rs_extension_api_init(info, access, MINIMUM_DUCKDB_VERSION).unwrap();
 
     if !have_api_struct {
         return Ok(false);

@@ -61,6 +61,8 @@ impl VTab for LabkeySyncVTab {
             &bind_data.config,
             &bind_data.schema_name,
             &bind_data.query_name,
+            &[],
+            &[],
         )?;
 
         let mgr = cache::CacheManager::new()?;

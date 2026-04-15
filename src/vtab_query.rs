@@ -10,13 +10,7 @@
 //! - `init()`: reads cached Parquet or fetches all rows and writes to cache.
 //! - `func()`: writes `RecordBatch` data to `DuckDB` vectors in chunks.
 
-use std::{
-    env,
-    error::Error,
-    path::{Path, PathBuf},
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::{env, error::Error, path::PathBuf, sync::Mutex, time::Duration};
 
 use arrow_array::{
     Array, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray,
@@ -37,8 +31,7 @@ use tokio::runtime::Runtime;
 use super::{cache, credential, types};
 
 const DEBUG_ENV_VAR: &str = "DUCK_LK_DEBUG";
-const FETCH_PAGE_SIZE_ROWS: i32 = 50_000;
-const FETCH_PROGRESS_TICK_MS: u64 = 100;
+const PHASE_PROGRESS_TICK_MS: u64 = 100;
 
 /// Bind data for the `labkey_query` table function.
 ///
@@ -50,6 +43,8 @@ pub(crate) struct LabkeyBindData {
     column_names: Vec<String>,
     /// Column `DuckDB` types in schema order.
     column_types: Vec<LogicalTypeId>,
+    /// Original `LabKey` JSON type strings in schema order.
+    column_json_types: Vec<String>,
     /// Resolved `LabKey` connection configuration.
     config: credential::ResolvedConfig,
     /// `LabKey` schema name (positional param 0).
@@ -139,27 +134,17 @@ impl VTab for LabkeyQueryVTab {
             };
         }
 
-        // 7. Cache hit — check staleness
+        // 7. Cache hit — use cached schema and defer staleness validation to init.
         if let Some(entry) = &cached_entry {
-            let is_fresh = match &entry.server_modified {
-                None => true,
-                Some(cached_modified) => {
-                    check_freshness(&config, &schema_name, &query_name, cached_modified)
-                        .unwrap_or(true)
-                }
-            };
-
-            if is_fresh {
-                register_columns_from_cache(bind, entry);
-                return Ok(bind_data_from_cache(
-                    config,
-                    entry,
-                    &mgr,
-                    schema_name,
-                    query_name,
-                    offline,
-                ));
-            }
+            register_columns_from_cache(bind, entry);
+            return Ok(bind_data_from_cache(
+                config,
+                entry,
+                &mgr,
+                schema_name,
+                query_name,
+                offline,
+            ));
         }
 
         // 8. Fresh fetch — get metadata from LabKey
@@ -196,10 +181,15 @@ impl VTab for LabkeyQueryVTab {
             .iter()
             .map(|c| types::map_json_type_to_duckdb(c.json_type.as_deref()))
             .collect();
+        let column_json_types: Vec<String> = filtered_columns
+            .iter()
+            .map(|c| c.json_type.clone().unwrap_or_default())
+            .collect();
 
         Ok(LabkeyBindData {
             column_names,
             column_types,
+            column_json_types,
             config,
             schema_name,
             query_name,
@@ -212,24 +202,103 @@ impl VTab for LabkeyQueryVTab {
         let bind_data = unsafe { &*init.get_bind_data::<LabkeyBindData>() };
 
         let parquet_path = if let Some(ref path) = bind_data.parquet_path {
-            path.clone()
+            if bind_data.offline {
+                path.clone()
+            } else {
+                let mgr = cache::CacheManager::new()?;
+                let key = cache::cache_key(
+                    &bind_data.config.base_url,
+                    &bind_data.config.container_path,
+                    &bind_data.schema_name,
+                    &bind_data.query_name,
+                )?;
+                let cached_entry = mgr.get_entry(&key).ok_or_else(|| {
+                    format!(
+                        "No cached data for {}.{}",
+                        bind_data.schema_name, bind_data.query_name
+                    )
+                })?;
+
+                let is_fresh = match &cached_entry.server_modified {
+                    None => true,
+                    Some(cached_modified) => {
+                        let spinner = build_phase_spinner(format!(
+                            "Checking whether {}.{} is stale...",
+                            bind_data.schema_name, bind_data.query_name
+                        ));
+                        let freshness = check_freshness(
+                            &bind_data.config,
+                            &bind_data.schema_name,
+                            &bind_data.query_name,
+                            cached_modified,
+                        );
+                        match freshness {
+                            Some(true) => {
+                                spinner.finish_with_message(format!(
+                                    "Cached data for {}.{} is fresh",
+                                    bind_data.schema_name, bind_data.query_name
+                                ));
+                                true
+                            }
+                            Some(false) => {
+                                spinner.finish_with_message(format!(
+                                    "Cached data for {}.{} is stale; refreshing...",
+                                    bind_data.schema_name, bind_data.query_name
+                                ));
+                                false
+                            }
+                            None => {
+                                spinner.finish_with_message(format!(
+                                    "Could not determine staleness for {}.{}; using cached data",
+                                    bind_data.schema_name, bind_data.query_name
+                                ));
+                                true
+                            }
+                        }
+                    }
+                };
+
+                if is_fresh {
+                    path.clone()
+                } else {
+                    let refreshed_path = sync_to_cache(
+                        &bind_data.config,
+                        &bind_data.schema_name,
+                        &bind_data.query_name,
+                        &[],
+                        &[],
+                    )?;
+
+                    let refreshed_entry = mgr.get_entry(&key).ok_or_else(|| {
+                        format!(
+                            "Cache refresh for {}.{} did not produce a cache entry",
+                            bind_data.schema_name, bind_data.query_name
+                        )
+                    })?;
+
+                    if !cache_columns_match_bind(bind_data, &refreshed_entry) {
+                        return Err(format!(
+                            "Schema for {}.{} changed after cache refresh; rerun the query so DuckDB can rebind the new columns",
+                            bind_data.schema_name, bind_data.query_name
+                        )
+                        .into());
+                    }
+
+                    refreshed_path
+                }
+            }
         } else {
             fetch_and_cache(bind_data)?
         };
 
-        let mut reader = cache::CacheManager::open_parquet_batch_reader(&parquet_path, 2048)?;
-        let current_batch = match reader.next() {
-            Some(Ok(batch)) => Some(batch),
-            Some(Err(err)) => return Err(Box::new(err)),
-            None => None,
-        };
+        let reader = cache::CacheManager::open_parquet_batch_reader(&parquet_path, 2048)?;
 
         init.set_max_threads(1);
 
         Ok(LabkeyInitData {
             stream: Mutex::new(ParquetStreamState {
                 reader,
-                current_batch,
+                current_batch: None,
                 row_offset: 0,
             }),
         })
@@ -248,6 +317,11 @@ impl VTab for LabkeyQueryVTab {
             .map_err(|_| "Parquet stream mutex poisoned")?;
 
         loop {
+            if stream.current_batch.is_none() && !advance_to_next_batch(&mut stream)? {
+                output.set_len(0);
+                return Ok(());
+            }
+
             let Some(current_batch) = stream.current_batch.as_ref() else {
                 output.set_len(0);
                 return Ok(());
@@ -362,6 +436,11 @@ fn bind_data_from_cache(
             .iter()
             .map(|c| types::map_json_type_to_duckdb(c.json_type.as_deref()))
             .collect(),
+        column_json_types: entry
+            .columns
+            .iter()
+            .map(|c| c.json_type.clone().unwrap_or_default())
+            .collect(),
         config,
         schema_name,
         query_name,
@@ -404,47 +483,49 @@ fn check_freshness(
     Some(server_modified == cached_modified)
 }
 
-struct PageFetchSpec {
-    offset: i64,
-    max_rows: i32,
-    include_metadata: bool,
-    include_total_count: bool,
+fn cache_columns_match_bind(bind_data: &LabkeyBindData, entry: &cache::CacheEntry) -> bool {
+    let entry_names: Vec<&str> = entry.columns.iter().map(|c| c.name.as_str()).collect();
+    let bind_names: Vec<&str> = bind_data.column_names.iter().map(String::as_str).collect();
+    let entry_types: Vec<&str> = entry
+        .columns
+        .iter()
+        .map(|c| c.json_type.as_deref().unwrap_or(""))
+        .collect();
+    let bind_types: Vec<&str> = bind_data
+        .column_json_types
+        .iter()
+        .map(String::as_str)
+        .collect();
+
+    entry_names == bind_names && entry_types == bind_types
 }
 
-struct PaginatedFetchResult {
+fn build_phase_spinner(message: String) -> ProgressBar {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    spinner.set_message(message);
+    spinner.enable_steady_tick(Duration::from_millis(PHASE_PROGRESS_TICK_MS));
+    spinner
+}
+
+struct FetchResult {
     columns: Vec<cache::CacheColumn>,
     row_count: usize,
     size_bytes: u64,
-    elapsed: Duration,
-}
-
-struct FetchSession<'a> {
-    schema_name: &'a str,
-    query_name: &'a str,
-    client: &'a LabkeyClient,
-    runtime: &'a Runtime,
-}
-
-struct FetchProgress {
-    written_rows: usize,
-    total_rows: Option<usize>,
-    total_pages: Option<usize>,
-    page: usize,
-    next_offset: i64,
-    started: Instant,
-}
-
-struct FetchBootstrap {
-    filtered_columns: Vec<QueryColumn>,
-    columns: Vec<cache::CacheColumn>,
-    writer: cache::IncrementalParquetWriter,
-    progress: FetchProgress,
 }
 
 struct CacheWriteTarget {
     key: String,
     relative_path: String,
     absolute_path: PathBuf,
+}
+
+struct ColumnMetadata {
+    column_names: Vec<String>,
+    column_json_types: Vec<String>,
 }
 
 fn debug_logging_enabled_value(value: Option<&str>) -> bool {
@@ -460,13 +541,13 @@ fn debug_logging_enabled() -> bool {
     debug_logging_enabled_value(env::var(DEBUG_ENV_VAR).ok().as_deref())
 }
 
-fn debug_log(message: impl AsRef<str>) {
+pub(crate) fn debug_log(message: impl AsRef<str>) {
     if debug_logging_enabled() {
         eprintln!("[duck-lk] {}", message.as_ref());
     }
 }
 
-fn format_elapsed(elapsed: Duration) -> String {
+pub(crate) fn format_elapsed(elapsed: Duration) -> String {
     let secs = elapsed.as_secs();
     let millis = elapsed.subsec_millis();
     if secs >= 60 {
@@ -480,160 +561,13 @@ fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
-fn format_rows_per_second(rows: usize, elapsed: Duration) -> String {
+pub(crate) fn format_rows_per_second(rows: usize, elapsed: Duration) -> String {
     let millis = elapsed.as_millis();
     if millis == 0 {
         return "- rows/s".to_string();
     }
     let rows_per_second = ((rows as u128) * 1_000) / millis;
     format!("{rows_per_second} rows/s")
-}
-
-impl<'a> FetchSession<'a> {
-    fn new(
-        schema_name: &'a str,
-        query_name: &'a str,
-        client: &'a LabkeyClient,
-        runtime: &'a Runtime,
-    ) -> Self {
-        Self {
-            schema_name,
-            query_name,
-            client,
-            runtime,
-        }
-    }
-
-    fn schema_name(&self) -> &str {
-        self.schema_name
-    }
-
-    fn query_name(&self) -> &str {
-        self.query_name
-    }
-
-    fn fetch_page(
-        &self,
-        spec: PageFetchSpec,
-    ) -> Result<labkey_rs::query::SelectRowsResponse, Box<dyn Error>> {
-        let opts = SelectRowsOptions::builder()
-            .schema_name(self.schema_name().to_owned())
-            .query_name(self.query_name().to_owned())
-            .include_metadata(spec.include_metadata)
-            .include_total_count(spec.include_total_count)
-            .max_rows(spec.max_rows)
-            .offset(spec.offset)
-            .build();
-        Ok(self.runtime.block_on(self.client.select_rows(opts))?)
-    }
-}
-
-impl FetchProgress {
-    fn new(
-        total_rows: Option<usize>,
-        first_response_rows: usize,
-        first_batch_rows: usize,
-        started: Instant,
-    ) -> Self {
-        Self {
-            written_rows: first_batch_rows,
-            total_rows,
-            total_pages: total_rows.map(|total| total.div_ceil(FETCH_PAGE_SIZE_ROWS as usize)),
-            page: 1,
-            next_offset: i64::try_from(first_response_rows).unwrap_or(i64::MAX),
-            started,
-        }
-    }
-
-    fn should_continue(&self) -> bool {
-        self.total_rows
-            .is_none_or(|total| self.written_rows < total)
-    }
-
-    fn message(&self, schema_name: &str, query_name: &str) -> String {
-        fetch_progress_message(
-            schema_name,
-            query_name,
-            self.written_rows,
-            self.total_rows,
-            self.page,
-            self.total_pages,
-            self.started.elapsed(),
-        )
-    }
-
-    fn record_page(&mut self, response_rows: usize, batch_rows: usize) {
-        self.page += 1;
-        self.written_rows += batch_rows;
-        self.next_offset += i64::try_from(response_rows).unwrap_or(i64::MAX);
-    }
-
-    fn elapsed(&self) -> Duration {
-        self.started.elapsed()
-    }
-}
-
-fn fetch_progress_message(
-    schema_name: &str,
-    query_name: &str,
-    written_rows: usize,
-    total_rows: Option<usize>,
-    page: usize,
-    total_pages: Option<usize>,
-    elapsed: Duration,
-) -> String {
-    let page_part = match total_pages {
-        Some(total) => format!("page {page}/{total}"),
-        None => format!("page {page}"),
-    };
-    let throughput = format_rows_per_second(written_rows, elapsed);
-    let elapsed = format_elapsed(elapsed);
-
-    match total_rows {
-        Some(total) => format!(
-            "Fetching {schema_name}.{query_name} from LabKey... {written_rows}/{total} rows ({page_part}, {throughput}, {elapsed})"
-        ),
-        None => format!(
-            "Fetching {schema_name}.{query_name} from LabKey... {written_rows} rows ({page_part}, {throughput}, {elapsed})"
-        ),
-    }
-}
-
-fn debug_fetch_start(session: &FetchSession, progress: &FetchProgress) {
-    debug_log(format!(
-        "fetch start schema={} query={} page_size={} total_rows={:?}",
-        session.schema_name(),
-        session.query_name(),
-        FETCH_PAGE_SIZE_ROWS,
-        progress.total_rows
-    ));
-}
-
-fn debug_page_fetched(page: usize, offset: i64, rows: usize, total_rows: Option<usize>) {
-    debug_log(format!(
-        "page fetched page={page} offset={offset} rows={rows} total_rows={total_rows:?}"
-    ));
-}
-
-fn debug_page_converted(page: usize, rows: usize) {
-    debug_log(format!("page converted page={page} rows={rows}"));
-}
-
-fn debug_page_written(page: usize, rows: usize) {
-    debug_log(format!("page written page={page} rows={rows}"));
-}
-
-fn build_fetch_spinner(schema_name: &str, query_name: &str) -> ProgressBar {
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    spinner.set_message(format!(
-        "Fetching {schema_name}.{query_name} from LabKey..."
-    ));
-    spinner.enable_steady_tick(Duration::from_millis(FETCH_PROGRESS_TICK_MS));
-    spinner
 }
 
 fn resolve_cache_write_target(
@@ -668,7 +602,7 @@ fn persist_cache_entry(
     config: &credential::ResolvedConfig,
     schema_name: &str,
     query_name: &str,
-    fetch_result: PaginatedFetchResult,
+    fetch_result: FetchResult,
     server_modified: Option<String>,
 ) -> Result<PathBuf, Box<dyn Error>> {
     let row_count = i64::try_from(fetch_result.row_count).unwrap_or(i64::MAX);
@@ -688,111 +622,54 @@ fn persist_cache_entry(
     Ok(target.absolute_path)
 }
 
-fn bootstrap_fetch(
-    session: &FetchSession,
-    pq_path: &Path,
-) -> Result<FetchBootstrap, Box<dyn Error>> {
-    let started = Instant::now();
-    let first_response = session.fetch_page(PageFetchSpec {
-        offset: 0,
-        max_rows: FETCH_PAGE_SIZE_ROWS,
-        include_metadata: true,
-        include_total_count: true,
-    })?;
-    let total_rows = usize::try_from(first_response.row_count).ok();
+fn fetch_column_metadata(
+    config: &credential::ResolvedConfig,
+    schema_name: &str,
+    query_name: &str,
+) -> Result<ColumnMetadata, Box<dyn Error>> {
+    let rt = Runtime::new()?;
+    let client_config = ClientConfig::new(
+        config.base_url.clone(),
+        config.credential.clone(),
+        config.container_path.clone(),
+    );
+    let client = LabkeyClient::new(client_config)?;
 
-    let meta_data = first_response
+    let meta_opts = SelectRowsOptions::builder()
+        .schema_name(schema_name.to_owned())
+        .query_name(query_name.to_owned())
+        .include_metadata(true)
+        .show_rows(ShowRows::None)
+        .build();
+    let meta_response = rt.block_on(client.select_rows(meta_opts))?;
+
+    let meta_data = meta_response
         .meta_data
-        .ok_or("LabKey did not return column metadata on paginated data fetch.")?;
+        .ok_or("LabKey did not return column metadata. The schema or query may not exist.")?;
     let filtered_columns = filter_columns(meta_data.fields);
-    let columns: Vec<cache::CacheColumn> = filtered_columns
-        .iter()
-        .map(|c| cache::CacheColumn {
-            name: c.name.clone(),
-            json_type: c.json_type.clone(),
-        })
-        .collect();
 
-    let first_batch = types::rows_to_record_batch(&first_response.rows, &filtered_columns)?;
-    let mut writer = cache::IncrementalParquetWriter::try_new(pq_path, first_batch.schema())?;
-    writer.write(&first_batch)?;
-
-    let progress = FetchProgress::new(
-        total_rows,
-        first_response.rows.len(),
-        first_batch.num_rows(),
-        started,
-    );
-    debug_fetch_start(session, &progress);
-    debug_page_fetched(1, 0, first_response.rows.len(), progress.total_rows);
-    debug_page_converted(1, first_batch.num_rows());
-    debug_page_written(1, first_batch.num_rows());
-
-    Ok(FetchBootstrap {
-        filtered_columns,
-        columns,
-        writer,
-        progress,
+    Ok(ColumnMetadata {
+        column_names: filtered_columns.iter().map(|c| c.name.clone()).collect(),
+        column_json_types: filtered_columns
+            .iter()
+            .map(|c| c.json_type.clone().unwrap_or_default())
+            .collect(),
     })
 }
 
-fn fetch_next_page(
-    session: &FetchSession,
-    filtered_columns: &[QueryColumn],
-    writer: &mut cache::IncrementalParquetWriter,
-    progress: &mut FetchProgress,
-) -> Result<bool, Box<dyn Error>> {
-    let page_response = session.fetch_page(PageFetchSpec {
-        offset: progress.next_offset,
-        max_rows: FETCH_PAGE_SIZE_ROWS,
-        include_metadata: false,
-        include_total_count: false,
-    })?;
-    let page = progress.page + 1;
-    debug_page_fetched(
-        page,
-        progress.next_offset,
-        page_response.rows.len(),
-        progress.total_rows,
-    );
-
-    if page_response.rows.is_empty() {
-        return Ok(false);
+fn resolve_sync_columns(
+    config: &credential::ResolvedConfig,
+    schema_name: &str,
+    query_name: &str,
+    column_names: &[String],
+    column_json_types: &[String],
+) -> Result<(Vec<String>, Vec<String>), Box<dyn Error>> {
+    if !column_names.is_empty() && column_names.len() == column_json_types.len() {
+        return Ok((column_names.to_vec(), column_json_types.to_vec()));
     }
 
-    let page_batch = types::rows_to_record_batch(&page_response.rows, filtered_columns)?;
-    debug_page_converted(page, page_batch.num_rows());
-    writer.write(&page_batch)?;
-    debug_page_written(page, page_batch.num_rows());
-    progress.record_page(page_response.rows.len(), page_batch.num_rows());
-    Ok(true)
-}
-
-fn fetch_pages_to_parquet(
-    session: &FetchSession,
-    pq_path: &Path,
-    spinner: &ProgressBar,
-) -> Result<PaginatedFetchResult, Box<dyn Error>> {
-    let FetchBootstrap {
-        filtered_columns,
-        columns,
-        mut writer,
-        mut progress,
-    } = bootstrap_fetch(session, pq_path)?;
-
-    while progress.should_continue() {
-        spinner.set_message(progress.message(session.schema_name(), session.query_name()));
-        if !fetch_next_page(session, &filtered_columns, &mut writer, &mut progress)? {
-            break;
-        }
-    }
-
-    Ok(PaginatedFetchResult {
-        columns,
-        row_count: progress.written_rows,
-        size_bytes: writer.finish()?,
-        elapsed: progress.elapsed(),
-    })
+    let metadata = fetch_column_metadata(config, schema_name, query_name)?;
+    Ok((metadata.column_names, metadata.column_json_types))
 }
 
 fn advance_to_next_batch(state: &mut ParquetStreamState) -> Result<bool, Box<dyn Error>> {
@@ -819,7 +696,45 @@ pub(crate) fn sync_to_cache(
     config: &credential::ResolvedConfig,
     schema_name: &str,
     query_name: &str,
+    column_names: &[String],
+    column_json_types: &[String],
 ) -> Result<std::path::PathBuf, Box<dyn Error>> {
+    let mgr = cache::CacheManager::new()?;
+    let target = resolve_cache_write_target(&mgr, config, schema_name, query_name)?;
+    let (column_names, column_json_types) = resolve_sync_columns(
+        config,
+        schema_name,
+        query_name,
+        column_names,
+        column_json_types,
+    )?;
+
+    let sql_result = super::experimental_sql::fetch_experimental_sql_to_parquet(
+        config,
+        schema_name,
+        query_name,
+        &column_names,
+        &column_json_types,
+        &target.absolute_path,
+    )?;
+
+    let fetch_result = FetchResult {
+        columns: column_names
+            .iter()
+            .zip(column_json_types.iter())
+            .map(|(name, jt)| cache::CacheColumn {
+                name: name.clone(),
+                json_type: if jt.is_empty() {
+                    None
+                } else {
+                    Some(jt.clone())
+                },
+            })
+            .collect(),
+        row_count: sql_result.row_count,
+        size_bytes: sql_result.size_bytes,
+    };
+
     let rt = Runtime::new()?;
     let client_config = ClientConfig::new(
         config.base_url.clone(),
@@ -827,18 +742,6 @@ pub(crate) fn sync_to_cache(
         config.container_path.clone(),
     );
     let client = LabkeyClient::new(client_config)?;
-    let spinner = build_fetch_spinner(schema_name, query_name);
-
-    let mgr = cache::CacheManager::new()?;
-    let target = resolve_cache_write_target(&mgr, config, schema_name, query_name)?;
-    let session = FetchSession::new(schema_name, query_name, &client, &rt);
-    let fetch_result = fetch_pages_to_parquet(&session, &target.absolute_path, &spinner)?;
-
-    spinner.finish_with_message(format!(
-        "Fetched {} rows from {schema_name}.{query_name} ({:.1}s)",
-        fetch_result.row_count,
-        fetch_result.elapsed.as_secs_f64(),
-    ));
 
     let server_modified =
         cache::CacheManager::check_staleness(&client, &rt, schema_name, query_name);
@@ -859,6 +762,8 @@ fn fetch_and_cache(bind_data: &LabkeyBindData) -> Result<std::path::PathBuf, Box
         &bind_data.config,
         &bind_data.schema_name,
         &bind_data.query_name,
+        &bind_data.column_names,
+        &bind_data.column_json_types,
     )
 }
 
@@ -1311,40 +1216,6 @@ mod tests {
     }
 
     #[test]
-    fn fetch_progress_message_with_total_rows() {
-        let msg = fetch_progress_message(
-            "lists",
-            "People",
-            500,
-            Some(1_000),
-            5,
-            Some(10),
-            Duration::from_secs(2),
-        );
-        assert_eq!(
-            msg,
-            "Fetching lists.People from LabKey... 500/1000 rows (page 5/10, 250 rows/s, 2.000s)"
-        );
-    }
-
-    #[test]
-    fn fetch_progress_message_without_total_rows() {
-        let msg = fetch_progress_message(
-            "lists",
-            "People",
-            500,
-            None,
-            5,
-            None,
-            Duration::from_millis(500),
-        );
-        assert_eq!(
-            msg,
-            "Fetching lists.People from LabKey... 500 rows (page 5, 1000 rows/s, 0.500s)"
-        );
-    }
-
-    #[test]
     fn debug_logging_enabled_value_truthy_values() {
         for value in ["1", "true", "TRUE", " yes ", "on"] {
             assert!(
@@ -1370,29 +1241,6 @@ mod tests {
                 "{value:?} should disable debug logging"
             );
         }
-    }
-
-    #[test]
-    fn fetch_progress_tracks_pages_offsets_and_counts() {
-        let mut progress = FetchProgress::new(Some(120_000), 50_000, 50_000, Instant::now());
-
-        assert!(progress.should_continue());
-        assert_eq!(progress.page, 1);
-        assert_eq!(progress.next_offset, 50_000);
-        assert_eq!(progress.written_rows, 50_000);
-        assert_eq!(progress.total_pages, Some(3));
-
-        progress.record_page(50_000, 50_000);
-        assert_eq!(progress.page, 2);
-        assert_eq!(progress.next_offset, 100_000);
-        assert_eq!(progress.written_rows, 100_000);
-        assert!(progress.should_continue());
-
-        progress.record_page(20_000, 20_000);
-        assert_eq!(progress.page, 3);
-        assert_eq!(progress.next_offset, 120_000);
-        assert_eq!(progress.written_rows, 120_000);
-        assert!(!progress.should_continue());
     }
 
     #[test]

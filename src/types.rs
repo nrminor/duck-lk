@@ -19,7 +19,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use chrono::{NaiveDate, NaiveDateTime};
 use duckdb::core::LogicalTypeId;
-use labkey_rs::query::{QueryColumn, Row};
+use serde_json::Value;
 
 /// Format strings tried (in order) when parsing a `LabKey` datetime value.
 /// The `Z` suffix is stripped before attempting these.
@@ -115,170 +115,172 @@ pub(crate) fn parse_date_days(s: &str) -> Option<i32> {
         .and_then(|d| i32::try_from((d - epoch).num_days()).ok())
 }
 
-/// Converts `LabKey` rows to an Arrow `RecordBatch`.
-///
-/// `columns` is the filtered column list (no hidden/URL columns — the caller
-/// is responsible for filtering those before calling this function).
-///
-/// Column order in the `RecordBatch` matches the order of `columns`.
-///
-/// # Null rules
-/// - Missing keys in `row.data` produce null.
-/// - Cells where `mv_indicator.is_some()` produce null regardless of `value`.
-/// - JSON `null` values produce null.
-/// - Failed type conversions produce null (never default values).
-///
-/// # Errors
-///
-/// Returns an error if `RecordBatch` construction fails (e.g. schema mismatch).
-pub(crate) fn rows_to_record_batch(
-    rows: &[Row],
-    columns: &[QueryColumn],
-) -> Result<RecordBatch, Box<dyn std::error::Error>> {
-    let fields: Vec<Field> = columns
+pub(crate) fn experimental_sql_schema(
+    column_names: &[String],
+    column_json_types: &[String],
+) -> Arc<Schema> {
+    let fields: Vec<Field> = column_names
         .iter()
-        .map(|col| {
-            let dt = map_json_type_to_arrow(col.json_type.as_deref());
-            Field::new(&col.name, dt, true)
-        })
+        .zip(column_json_types.iter())
+        .map(|(name, json_type)| Field::new(name, map_json_type_to_arrow(Some(json_type)), true))
         .collect();
+    Arc::new(Schema::new(fields))
+}
 
-    let schema = Arc::new(Schema::new(fields));
-
-    let arrays: Vec<Arc<dyn arrow_array::Array>> = columns
+/// Converts experimental SQL response rows into an Arrow `RecordBatch`.
+pub(crate) fn sql_rows_to_record_batch(
+    rows: &[Vec<Value>],
+    column_names: &[String],
+    column_json_types: &[String],
+) -> Result<RecordBatch, Box<dyn std::error::Error>> {
+    let schema = experimental_sql_schema(column_names, column_json_types);
+    let arrays: Vec<Arc<dyn arrow_array::Array>> = column_json_types
         .iter()
-        .map(|col| build_column_array(rows, col))
+        .enumerate()
+        .map(|(column_index, json_type)| build_sql_column_array(rows, column_index, json_type))
         .collect();
 
     let batch = RecordBatch::try_new(schema, arrays)?;
     Ok(batch)
 }
 
-/// Builds an Arrow array for a single column from all rows.
-fn build_column_array(rows: &[Row], col: &QueryColumn) -> Arc<dyn arrow_array::Array> {
-    let arrow_type = map_json_type_to_arrow(col.json_type.as_deref());
+fn sql_value(row: &[Value], column_index: usize) -> Option<&Value> {
+    row.get(column_index).filter(|value| !value.is_null())
+}
+
+fn sql_int64_value(row: &[Value], column_index: usize) -> Option<i64> {
+    sql_value(row, column_index).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    })
+}
+
+fn sql_float64_value(row: &[Value], column_index: usize) -> Option<f64> {
+    sql_value(row, column_index).and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    })
+}
+
+fn sql_bool_value(row: &[Value], column_index: usize) -> Option<bool> {
+    sql_value(row, column_index).and_then(|value| {
+        value
+            .as_bool()
+            .or_else(|| value.as_i64().map(|number| number != 0))
+            .or_else(|| {
+                value
+                    .as_str()
+                    .and_then(|text| match text.trim().to_ascii_lowercase().as_str() {
+                        "true" | "t" | "1" | "yes" | "y" => Some(true),
+                        "false" | "f" | "0" | "no" | "n" => Some(false),
+                        _ => None,
+                    })
+            })
+    })
+}
+
+fn build_sql_int64_array(rows: &[Vec<Value>], column_index: usize) -> Arc<dyn arrow_array::Array> {
+    let mut builder = Int64Builder::with_capacity(rows.len());
+    for row in rows {
+        match sql_int64_value(row, column_index) {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+fn build_sql_float64_array(
+    rows: &[Vec<Value>],
+    column_index: usize,
+) -> Arc<dyn arrow_array::Array> {
+    let mut builder = Float64Builder::with_capacity(rows.len());
+    for row in rows {
+        match sql_float64_value(row, column_index) {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+fn build_sql_bool_array(rows: &[Vec<Value>], column_index: usize) -> Arc<dyn arrow_array::Array> {
+    let mut builder = BooleanBuilder::with_capacity(rows.len());
+    for row in rows {
+        match sql_bool_value(row, column_index) {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+fn build_sql_timestamp_array(
+    rows: &[Vec<Value>],
+    column_index: usize,
+) -> Arc<dyn arrow_array::Array> {
+    let mut builder = TimestampMicrosecondBuilder::with_capacity(rows.len());
+    for row in rows {
+        let value = sql_value(row, column_index)
+            .and_then(|value| value.as_str())
+            .and_then(parse_datetime_micros);
+        match value {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+fn build_sql_date_array(rows: &[Vec<Value>], column_index: usize) -> Arc<dyn arrow_array::Array> {
+    let mut builder = Date32Builder::with_capacity(rows.len());
+    for row in rows {
+        let value = sql_value(row, column_index)
+            .and_then(|value| value.as_str())
+            .and_then(parse_date_days);
+        match value {
+            Some(v) => builder.append_value(v),
+            None => builder.append_null(),
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+fn build_sql_utf8_array(rows: &[Vec<Value>], column_index: usize) -> Arc<dyn arrow_array::Array> {
+    let mut builder = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
+    for row in rows {
+        match sql_value(row, column_index) {
+            None => builder.append_null(),
+            Some(value) => {
+                if let Some(text) = value.as_str() {
+                    builder.append_value(text);
+                } else {
+                    builder.append_value(value.to_string());
+                }
+            }
+        }
+    }
+    Arc::new(builder.finish())
+}
+
+fn build_sql_column_array(
+    rows: &[Vec<Value>],
+    column_index: usize,
+    json_type: &str,
+) -> Arc<dyn arrow_array::Array> {
+    let arrow_type = map_json_type_to_arrow(Some(json_type));
 
     match arrow_type {
-        DataType::Int64 => {
-            let mut builder = Int64Builder::with_capacity(rows.len());
-            for row in rows {
-                append_int64(&mut builder, row, &col.name);
-            }
-            Arc::new(builder.finish())
-        }
-        DataType::Float64 => {
-            let mut builder = Float64Builder::with_capacity(rows.len());
-            for row in rows {
-                append_float64(&mut builder, row, &col.name);
-            }
-            Arc::new(builder.finish())
-        }
-        DataType::Boolean => {
-            let mut builder = BooleanBuilder::with_capacity(rows.len());
-            for row in rows {
-                append_boolean(&mut builder, row, &col.name);
-            }
-            Arc::new(builder.finish())
-        }
+        DataType::Int64 => build_sql_int64_array(rows, column_index),
+        DataType::Float64 => build_sql_float64_array(rows, column_index),
+        DataType::Boolean => build_sql_bool_array(rows, column_index),
         DataType::Timestamp(TimeUnit::Microsecond, None) => {
-            let mut builder = TimestampMicrosecondBuilder::with_capacity(rows.len());
-            for row in rows {
-                append_timestamp(&mut builder, row, &col.name);
-            }
-            Arc::new(builder.finish())
+            build_sql_timestamp_array(rows, column_index)
         }
-        DataType::Date32 => {
-            let mut builder = Date32Builder::with_capacity(rows.len());
-            for row in rows {
-                append_date32(&mut builder, row, &col.name);
-            }
-            Arc::new(builder.finish())
-        }
-        // Utf8 covers "string", "time", None, and unknown json_types
-        _ => {
-            let mut builder = StringBuilder::with_capacity(rows.len(), rows.len() * 32);
-            for row in rows {
-                append_utf8(&mut builder, row, &col.name);
-            }
-            Arc::new(builder.finish())
-        }
-    }
-}
-
-/// Returns `Some(&CellValue)` if the cell is present, not null, and not marked
-/// as missing-value. Returns `None` if the key is missing from the row, the
-/// cell has `mv_indicator.is_some()`, or the value is JSON `null`.
-fn get_cell<'a>(row: &'a Row, col_name: &str) -> Option<&'a labkey_rs::query::CellValue> {
-    let cell = row.data.get(col_name)?;
-    if cell.mv_indicator.is_some() || cell.value.is_null() {
-        return None;
-    }
-    Some(cell)
-}
-
-fn append_int64(builder: &mut Int64Builder, row: &Row, col_name: &str) {
-    let value = get_cell(row, col_name).and_then(|cell| {
-        cell.value
-            .as_i64()
-            .or_else(|| cell.value.as_str().and_then(|s| s.parse().ok()))
-    });
-    match value {
-        Some(v) => builder.append_value(v),
-        None => builder.append_null(),
-    }
-}
-
-fn append_float64(builder: &mut Float64Builder, row: &Row, col_name: &str) {
-    let value = get_cell(row, col_name).and_then(|cell| {
-        cell.value
-            .as_f64()
-            .or_else(|| cell.value.as_str().and_then(|s| s.parse().ok()))
-    });
-    match value {
-        Some(v) => builder.append_value(v),
-        None => builder.append_null(),
-    }
-}
-
-fn append_boolean(builder: &mut BooleanBuilder, row: &Row, col_name: &str) {
-    let value = get_cell(row, col_name).and_then(|cell| cell.value.as_bool());
-    match value {
-        Some(v) => builder.append_value(v),
-        None => builder.append_null(),
-    }
-}
-
-fn append_timestamp(builder: &mut TimestampMicrosecondBuilder, row: &Row, col_name: &str) {
-    let value = get_cell(row, col_name)
-        .and_then(|cell| cell.value.as_str())
-        .and_then(parse_datetime_micros);
-    match value {
-        Some(v) => builder.append_value(v),
-        None => builder.append_null(),
-    }
-}
-
-fn append_date32(builder: &mut Date32Builder, row: &Row, col_name: &str) {
-    let value = get_cell(row, col_name)
-        .and_then(|cell| cell.value.as_str())
-        .and_then(parse_date_days);
-    match value {
-        Some(v) => builder.append_value(v),
-        None => builder.append_null(),
-    }
-}
-
-fn append_utf8(builder: &mut StringBuilder, row: &Row, col_name: &str) {
-    match get_cell(row, col_name) {
-        None => builder.append_null(),
-        Some(cell) => {
-            if let Some(s) = cell.value.as_str() {
-                builder.append_value(s);
-            } else {
-                // Non-string, non-null values: serialize as string via to_string()
-                builder.append_value(cell.value.to_string());
-            }
-        }
+        DataType::Date32 => build_sql_date_array(rows, column_index),
+        _ => build_sql_utf8_array(rows, column_index),
     }
 }
 
@@ -286,60 +288,9 @@ fn append_utf8(builder: &mut StringBuilder, row: &Row, col_name: &str) {
 mod tests {
     use super::*;
     use arrow_array::{
-        Array, BooleanArray, Date32Array, Float64Array, Int64Array, StringArray,
-        TimestampMicrosecondArray,
+        Array, BooleanArray, Date32Array, Int64Array, StringArray, TimestampMicrosecondArray,
     };
-    use labkey_rs::query::CellValue;
     use serde_json::json;
-
-    fn cell(value: serde_json::Value) -> CellValue {
-        CellValue {
-            value,
-            display_value: None,
-            formatted_value: None,
-            url: None,
-            mv_value: None,
-            mv_indicator: None,
-        }
-    }
-
-    fn cell_with_mv(value: serde_json::Value, mv: &str) -> CellValue {
-        CellValue {
-            value,
-            display_value: None,
-            formatted_value: None,
-            url: None,
-            mv_value: None,
-            mv_indicator: Some(mv.to_string()),
-        }
-    }
-
-    fn make_row(data: Vec<(&str, CellValue)>) -> Row {
-        Row {
-            data: data.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
-            links: None,
-        }
-    }
-
-    fn make_column(name: &str, json_type: Option<&str>) -> QueryColumn {
-        let mut col_json = json!({
-            "name": name,
-            "fieldKey": name,
-            "hidden": false,
-            "nullable": true,
-            "keyField": false,
-            "versionField": false,
-            "readOnly": false,
-            "userEditable": true,
-            "autoIncrement": false,
-            "mvEnabled": false,
-            "selectable": true,
-        });
-        if let Some(jt) = json_type {
-            col_json["jsonType"] = json!(jt);
-        }
-        serde_json::from_value(col_json).expect("QueryColumn deserialization must not change")
-    }
 
     /// Expected microsecond timestamp for 2024-01-15 09:30:00 UTC.
     fn expected_micros_2024_01_15_0930() -> i64 {
@@ -565,403 +516,69 @@ mod tests {
     }
 
     #[test]
-    fn record_batch_int64_extraction() {
-        let columns = vec![make_column("id", Some("int"))];
+    fn sql_rows_to_record_batch_parses_basic_types() {
         let rows = vec![
-            make_row(vec![("id", cell(json!(42)))]),
-            make_row(vec![("id", cell(json!("99")))]),
-            make_row(vec![("id", cell(json!("not_a_number")))]),
+            vec![json!(1), json!("Alice"), json!("true")],
+            vec![json!(2), serde_json::Value::Null, json!(0)],
         ];
+        let column_names = vec!["id".into(), "name".into(), "active".into()];
+        let column_json_types = vec!["int".into(), "string".into(), "boolean".into()];
 
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        assert_eq!(batch.num_rows(), 3);
+        let batch = sql_rows_to_record_batch(&rows, &column_names, &column_json_types)
+            .expect("sql RecordBatch");
 
-        let arr = batch
+        let ids = batch
             .column(0)
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("Int64Array");
-        assert_eq!(arr.value(0), 42);
-        assert_eq!(arr.value(1), 99);
-        assert!(arr.is_null(2));
-    }
+        assert_eq!(ids.value(0), 1);
+        assert_eq!(ids.value(1), 2);
 
-    #[test]
-    fn record_batch_int64_null_value() {
-        let columns = vec![make_column("id", Some("int"))];
-        let rows = vec![make_row(vec![("id", cell(json!(null)))])];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Int64Array");
-        assert!(arr.is_null(0));
-    }
-
-    #[test]
-    fn record_batch_int64_float_encoded() {
-        // LabKey sometimes sends 42.0 for int columns; as_i64() returns None
-        // for f64 values in serde_json, so this becomes null. Document this.
-        let columns = vec![make_column("id", Some("int"))];
-        let rows = vec![make_row(vec![("id", cell(json!(42.0)))])];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Int64Array");
-        // serde_json::Value(42.0).as_i64() returns None — this is null, not 42
-        assert!(arr.is_null(0));
-    }
-
-    #[test]
-    fn record_batch_float64_extraction() {
-        let columns = vec![make_column("score", Some("float"))];
-        let rows = vec![
-            make_row(vec![("score", cell(json!(3.125)))]),
-            make_row(vec![("score", cell(json!("2.5")))]),
-            make_row(vec![("score", cell(json!("nan_value")))]),
-        ];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Float64Array");
-
-        assert!((arr.value(0) - 3.125).abs() < f64::EPSILON);
-        assert!((arr.value(1) - 2.5).abs() < f64::EPSILON);
-        assert!(arr.is_null(2));
-    }
-
-    #[test]
-    fn record_batch_float64_from_integer() {
-        // json!(42) in a float column: as_f64() on a JSON integer returns Some(42.0)
-        let columns = vec![make_column("score", Some("float"))];
-        let rows = vec![make_row(vec![("score", cell(json!(42)))])];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Float64Array");
-        assert!((arr.value(0) - 42.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn record_batch_float64_null_value() {
-        let columns = vec![make_column("score", Some("float"))];
-        let rows = vec![make_row(vec![("score", cell(json!(null)))])];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Float64Array");
-        assert!(arr.is_null(0));
-    }
-
-    #[test]
-    fn record_batch_boolean_extraction() {
-        let columns = vec![make_column("active", Some("boolean"))];
-        let rows = vec![
-            make_row(vec![("active", cell(json!(true)))]),
-            make_row(vec![("active", cell(json!(false)))]),
-            make_row(vec![("active", cell(json!("true")))]),
-        ];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .expect("BooleanArray");
-
-        assert!(arr.value(0));
-        assert!(!arr.value(1));
-        assert!(arr.is_null(2)); // as_bool() on a string returns None
-    }
-
-    #[test]
-    fn record_batch_boolean_null_value() {
-        let columns = vec![make_column("active", Some("boolean"))];
-        let rows = vec![make_row(vec![("active", cell(json!(null)))])];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .expect("BooleanArray");
-        assert!(arr.is_null(0));
-    }
-
-    #[test]
-    fn record_batch_utf8_extraction() {
-        let columns = vec![make_column("name", Some("string"))];
-        let rows = vec![
-            make_row(vec![("name", cell(json!("Alice")))]),
-            make_row(vec![("name", cell(json!(42)))]),
-        ];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
-            .column(0)
+        let names = batch
+            .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("StringArray");
+        assert_eq!(names.value(0), "Alice");
+        assert!(names.is_null(1));
 
-        assert_eq!(arr.value(0), "Alice");
-        assert_eq!(arr.value(1), "42");
-    }
-
-    #[test]
-    fn record_batch_utf8_null_value_is_sql_null() {
-        // json!(null) in a string column must produce SQL NULL, not the
-        // four-character string "null".
-        let columns = vec![make_column("name", Some("string"))];
-        let rows = vec![make_row(vec![("name", cell(json!(null)))])];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
-            .column(0)
+        let active = batch
+            .column(2)
             .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("StringArray");
-        assert!(arr.is_null(0));
+            .downcast_ref::<BooleanArray>()
+            .expect("BooleanArray");
+        assert!(active.value(0));
+        assert!(!active.value(1));
     }
 
     #[test]
-    fn record_batch_timestamp_extraction() {
-        let columns = vec![make_column("created", Some("dateTime"))];
-        let rows = vec![
-            make_row(vec![("created", cell(json!("2024-01-15T09:30:00.000Z")))]),
-            make_row(vec![("created", cell(json!("bad-datetime")))]),
-        ];
+    fn sql_rows_to_record_batch_parses_dates_and_timestamps() {
+        let rows = vec![vec![json!("2024-01-15"), json!("2024-01-15T09:30:00.000Z")]];
+        let column_names = vec!["created_on".into(), "created_at".into()];
+        let column_json_types = vec!["date".into(), "dateTime".into()];
 
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<TimestampMicrosecondArray>()
-            .expect("TimestampMicrosecondArray");
+        let batch = sql_rows_to_record_batch(&rows, &column_names, &column_json_types)
+            .expect("sql RecordBatch");
 
-        assert_eq!(arr.value(0), expected_micros_2024_01_15_0930());
-        assert!(arr.is_null(1));
-    }
-
-    #[test]
-    fn record_batch_date32_extraction() {
-        let columns = vec![make_column("dob", Some("date"))];
-        let rows = vec![
-            make_row(vec![("dob", cell(json!("2024-01-15")))]),
-            make_row(vec![("dob", cell(json!("01/15/2024")))]),
-            make_row(vec![("dob", cell(json!("bad-date")))]),
-        ];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
+        let dates = batch
             .column(0)
             .as_any()
             .downcast_ref::<Date32Array>()
             .expect("Date32Array");
+        assert_eq!(
+            dates.value(0),
+            parse_date_days("2024-01-15").expect("date days")
+        );
 
-        assert!(!arr.is_null(0));
-        assert_eq!(arr.value(0), arr.value(1));
-        assert!(arr.is_null(2));
-    }
-
-    #[test]
-    fn record_batch_mv_indicator_nulls_int() {
-        let columns = vec![make_column("id", Some("int"))];
-        let rows = vec![make_row(vec![("id", cell_with_mv(json!(42), "Q"))])];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Int64Array");
-        assert!(arr.is_null(0));
-    }
-
-    #[test]
-    fn record_batch_mv_indicator_nulls_string() {
-        let columns = vec![make_column("name", Some("string"))];
-        let rows = vec![make_row(vec![("name", cell_with_mv(json!("Alice"), "Q"))])];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("StringArray");
-        assert!(arr.is_null(0));
-    }
-
-    #[test]
-    fn record_batch_missing_key_is_null() {
-        let columns = vec![
-            make_column("present", Some("int")),
-            make_column("absent", Some("int")),
-        ];
-        let rows = vec![make_row(vec![("present", cell(json!(1)))])];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let present_arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Int64Array");
-        let absent_arr = batch
+        let timestamps = batch
             .column(1)
             .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Int64Array");
-
-        assert_eq!(present_arr.value(0), 1);
-        assert!(absent_arr.is_null(0));
-    }
-
-    #[test]
-    fn record_batch_sparse_rows() {
-        let columns = vec![
-            make_column("a", Some("string")),
-            make_column("b", Some("int")),
-            make_column("c", Some("float")),
-        ];
-        let rows = vec![
-            make_row(vec![("a", cell(json!("hello")))]),
-            make_row(vec![("b", cell(json!(42)))]),
-            make_row(vec![("c", cell(json!(3.125)))]),
-        ];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        assert_eq!(batch.num_rows(), 3);
-        assert_eq!(batch.num_columns(), 3);
-
-        let a = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("StringArray");
-        assert_eq!(a.value(0), "hello");
-        assert!(a.is_null(1));
-        assert!(a.is_null(2));
-
-        let b = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Int64Array");
-        assert!(b.is_null(0));
-        assert_eq!(b.value(1), 42);
-        assert!(b.is_null(2));
-
-        let c = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<Float64Array>()
-            .expect("Float64Array");
-        assert!(c.is_null(0));
-        assert!(c.is_null(1));
-        assert!((c.value(2) - 3.125).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn record_batch_empty_rows() {
-        let columns = vec![make_column("id", Some("int"))];
-        let rows: Vec<Row> = vec![];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        assert_eq!(batch.num_rows(), 0);
-        assert_eq!(batch.num_columns(), 1);
-    }
-
-    #[test]
-    fn record_batch_no_columns_returns_error() {
-        let columns: Vec<QueryColumn> = vec![];
-        let rows = vec![make_row(vec![("x", cell(json!(1)))])];
-
-        let result = rows_to_record_batch(&rows, &columns);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn record_batch_none_json_type_fallback() {
-        let columns = vec![make_column("mystery", None)];
-        let rows = vec![
-            make_row(vec![("mystery", cell(json!("text")))]),
-            make_row(vec![("mystery", cell(json!(123)))]),
-        ];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("StringArray");
-
-        assert_eq!(arr.value(0), "text");
-        assert_eq!(arr.value(1), "123");
-    }
-
-    #[test]
-    fn record_batch_time_type_as_utf8() {
-        let columns = vec![make_column("t", Some("time"))];
-        let rows = vec![make_row(vec![("t", cell(json!("14:30:00")))])];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        let arr = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("StringArray");
-        assert_eq!(arr.value(0), "14:30:00");
-    }
-
-    #[test]
-    fn record_batch_multiple_types_smoke() {
-        let columns = vec![
-            make_column("id", Some("int")),
-            make_column("name", Some("string")),
-            make_column("score", Some("float")),
-            make_column("active", Some("boolean")),
-            make_column("created", Some("dateTime")),
-            make_column("dob", Some("date")),
-        ];
-        let rows = vec![make_row(vec![
-            ("id", cell(json!(1))),
-            ("name", cell(json!("Alice"))),
-            ("score", cell(json!(95.5))),
-            ("active", cell(json!(true))),
-            ("created", cell(json!("2024-01-15T09:30:00.000Z"))),
-            ("dob", cell(json!("1990-05-20"))),
-        ])];
-
-        let batch = rows_to_record_batch(&rows, &columns).expect("batch");
-        assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 6);
-
-        // Spot-check a couple values to go beyond shape testing
-        let id = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int64Array>()
-            .expect("Int64Array");
-        assert_eq!(id.value(0), 1);
-
-        let name = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("StringArray");
-        assert_eq!(name.value(0), "Alice");
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("TimestampMicrosecondArray");
+        assert_eq!(
+            timestamps.value(0),
+            parse_datetime_micros("2024-01-15T09:30:00.000Z").expect("timestamp micros")
+        );
     }
 }
