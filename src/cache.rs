@@ -10,6 +10,7 @@
 
 use std::{
     collections::HashMap,
+    env,
     error::Error,
     fs::File,
     path::{Path, PathBuf},
@@ -27,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 const CURRENT_CACHE_VERSION: u32 = 1;
+const CACHE_DIR_ENV_VAR: &str = "DUCK_LK_CACHE_DIR";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CacheFile {
@@ -225,12 +227,18 @@ pub(crate) struct CacheManager {
 impl CacheManager {
     /// Creates a new `CacheManager`.
     ///
-    /// Uses `dirs::cache_dir()` + `"duck-lk"` as the cache root. Creates the
+    /// Uses `DUCK_LK_CACHE_DIR` when set; otherwise falls back to
+    /// `dirs::cache_dir()` + `"duck-lk"` as the cache root. Creates the
     /// directory (including parents) if it does not exist.
     pub(crate) fn new() -> Result<Self, Box<dyn Error>> {
-        let base = dirs::cache_dir()
-            .ok_or("Could not determine platform cache directory (dirs::cache_dir)")?;
-        let cache_dir = base.join("duck-lk");
+        let cache_dir = match env::var(CACHE_DIR_ENV_VAR) {
+            Ok(path) if !path.trim().is_empty() => PathBuf::from(path),
+            _ => {
+                let base = dirs::cache_dir()
+                    .ok_or("Could not determine platform cache directory (dirs::cache_dir)")?;
+                base.join("duck-lk")
+            }
+        };
         std::fs::create_dir_all(&cache_dir)?;
         Ok(Self { cache_dir })
     }
@@ -419,13 +427,42 @@ mod tests {
     use super::*;
     use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_cache_env<F: FnOnce()>(value: Option<&std::path::Path>, f: F) {
+        let lock = ENV_LOCK.get_or_init(|| Mutex::new(()));
+        let _guard = lock.lock().expect("env lock");
+        let original = std::env::var(CACHE_DIR_ENV_VAR).ok();
+
+        match value {
+            Some(path) => std::env::set_var(CACHE_DIR_ENV_VAR, path),
+            None => std::env::remove_var(CACHE_DIR_ENV_VAR),
+        }
+
+        f();
+
+        match original {
+            Some(value) => std::env::set_var(CACHE_DIR_ENV_VAR, value),
+            None => std::env::remove_var(CACHE_DIR_ENV_VAR),
+        }
+    }
 
     /// Creates a `CacheManager` backed by a temporary directory.
     fn test_manager() -> (CacheManager, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let mgr = CacheManager::with_dir(dir.path().to_path_buf()).expect("CacheManager::with_dir");
         (mgr, dir)
+    }
+
+    #[test]
+    fn new_uses_duck_lk_cache_dir_when_set() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        with_cache_env(Some(dir.path()), || {
+            let mgr = CacheManager::new().expect("CacheManager::new");
+            assert_eq!(mgr.cache_dir, dir.path());
+        });
     }
 
     /// Creates a sample `CacheEntry` for testing.
